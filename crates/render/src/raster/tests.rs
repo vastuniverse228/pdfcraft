@@ -9953,6 +9953,7 @@ mod truetype_loca_format;
 
 // An Arial (#5889) or Times New Roman (#6449) the PDF doesn't embed draws the glyphs its codes
 // name.
+mod cyrillic_differences;
 mod non_embedded_arial;
 
 // A Type 3 font without /Widths advances by its glyphs' d0/d1 widths (PDFBOX-2943).

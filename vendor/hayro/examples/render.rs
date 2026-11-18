@@ -39,6 +39,7 @@ fn main() {
                 let name = pick_standard_font(s);
                 load_asset(name).or_else(|| Some(s.get_font_data()))
             }
+            FontQuery::GlyphCoverage { .. } => None,
             FontQuery::Fallback(f) => {
                 if let Some(cc) = &f.character_collection {
                     let name = match cc.family {

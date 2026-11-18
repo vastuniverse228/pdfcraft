@@ -392,6 +392,9 @@ pub(crate) struct StandardKind {
     fallback: bool,
     glyph_to_code: RefCell<HashMap<GlyphId, u8>>,
     encodings: HashMap<u8, String>,
+    /// Characters the stand-in lacks (Cyrillic `afii…` names, Greek), when the resolver
+    /// supplied a coverage face. `None` leaves those glyphs blank.
+    coverage: Option<CoverageFont>,
 }
 
 impl StandardKind {
@@ -419,6 +422,9 @@ impl StandardKind {
 
         let (blob, index) = resolver(&FontQuery::Standard(base_font))?;
         let base_font_blob = StandardFontBlob::from_data(blob, index)?;
+        let coverage = resolver(&FontQuery::GlyphCoverage { bold: base_font.is_bold() })
+            .and_then(|(data, index)| OpenTypeFontBlob::new(data, index))
+            .map(|blob| CoverageFont(StandardFontBlob::new_otf(blob)));
 
         Some(Self {
             base_font,
@@ -429,6 +435,7 @@ impl StandardKind {
             glyph_to_code: RefCell::new(HashMap::new()),
             fallback,
             encoding,
+            coverage,
         })
     }
 
@@ -460,6 +467,9 @@ impl StandardKind {
                     // PdfCraft patch: an accented letter the stand-in lacks is built from its
                     // parts (see `ACCENTED_LETTERS`).
                     .or_else(|| self.composite_glyph(code, c))
+                    // PdfCraft patch: Cyrillic and Greek the stand-in lacks, named in
+                    // `/Differences` (`afii10017` for А), are drawn from the coverage face.
+                    .or_else(|| self.coverage_glyph(code, c))
             })
             .unwrap_or(GlyphId::NOTDEF);
         self.glyph_to_code.borrow_mut().insert(result, code);
@@ -475,6 +485,54 @@ impl StandardKind {
         self.base_font_blob.name_to_glyph(base)?;
         self.base_font_blob.name_to_glyph(accent)?;
         Some(GlyphId::new(COMPOSITE_GLYPH_BASE + u32::from(code)))
+    }
+
+    /// The coverage face's glyph for `name`, packed with `code`, when the stand-in has
+    /// neither the name nor the character.
+    fn coverage_glyph(&self, code: u8, name: &str) -> Option<GlyphId> {
+        let gid = self.coverage_gid(name)?;
+        Some(GlyphId::new(COVERAGE_GLYPH_BASE + (u32::from(code) << 16) + (gid.to_u32() & 0xFFFF)))
+    }
+
+    /// The coverage face's glyph id for `name`. `None` when the stand-in can draw it, the
+    /// name is not one character, or the coverage face has no glyph (including `.notdef`).
+    fn coverage_gid(&self, name: &str) -> Option<GlyphId> {
+        if self.base_font_blob.name_to_glyph(name).is_some() {
+            return None;
+        }
+        let ch = glyph_name_to_unicode(name)?;
+        if self.base_font_blob.unicode_to_glyph(u32::from(ch)).is_some() {
+            return None;
+        }
+        let gid = self.coverage.as_ref()?.0.unicode_to_glyph(u32::from(ch))?;
+        (gid.to_u32() != 0).then_some(gid)
+    }
+
+    /// The coverage face's advance for `name`, in the same thousandths of an em as the
+    /// stand-in's outlines. `None` when [`Self::coverage_gid`] is.
+    fn coverage_advance_name(&self, name: &str) -> Option<f32> {
+        let gid = self.coverage_gid(name)?;
+        self.coverage.as_ref()?.0.advance_width(gid)
+    }
+
+    fn coverage_outline(&self, glyph: GlyphId) -> Option<BezPath> {
+        let packed = glyph.to_u32().checked_sub(COVERAGE_GLYPH_BASE)?;
+        let gid = GlyphId::new(packed & 0xFFFF);
+        let mut path = self.coverage.as_ref()?.0.outline_glyph(gid);
+        if path.is_empty() {
+            return None;
+        }
+        // The stand-in's italic leans; the coverage face is upright. A small shear keeps
+        // the letter with the rest of an italic line.
+        if self.base_font.is_italic() {
+            path = Affine::new([1.0, 0.0, 0.21, 1.0, 0.0, 0.0]) * path;
+        }
+        Some(path)
+    }
+
+    fn coverage_advance_gid(&self, glyph: GlyphId) -> Option<f32> {
+        let packed = glyph.to_u32().checked_sub(COVERAGE_GLYPH_BASE)?;
+        self.coverage.as_ref()?.0.advance_width(GlyphId::new(packed & 0xFFFF))
     }
 
     /// PdfCraft patch: the outline of a glyph from [`Self::composite_glyph`] — the base letter,
@@ -541,15 +599,19 @@ impl StandardKind {
     pub(crate) fn outline_glyph(&self, glyph: GlyphId) -> BezPath {
         let composite = self.composite_outline(glyph);
         let is_composite = composite.is_some();
-        let path = composite.unwrap_or_else(|| self.base_font_blob.outline_glyph(glyph));
+        let coverage = if is_composite { None } else { self.coverage_outline(glyph) };
+        let is_coverage = coverage.is_some();
+        let path = composite.or(coverage).unwrap_or_else(|| self.base_font_blob.outline_glyph(glyph));
 
         // If the font is not embedded, we might need to stretch it so that
         // it matches the metrics of the actual underlying font blob.
 
         // PdfCraft patch: a composite id isn't a glyph of the blob, so its width comes from the
-        // standard metrics of its name.
+        // standard metrics of its name. A coverage glyph's width is the coverage face's advance.
         let blob_width = if is_composite {
             None
+        } else if is_coverage {
+            self.coverage_advance_gid(glyph)
         } else {
             self.base_font_blob.advance_width(glyph)
         };
@@ -597,10 +659,13 @@ impl StandardKind {
     pub(crate) fn glyph_width(&self, code: u8) -> Option<f32> {
         match self.widths.get(code as usize).copied() {
             Some(Width::Value(w)) => Some(w),
-            Some(Width::Missing) => Some(self.missing_width),
-            None => self
-                .code_to_ps_name(code)
-                .and_then(|c| self.base_font.get_width(c)),
+            // A code the stand-in cannot draw, and whose missing width is 0, would stack
+            // every such letter on one point. The coverage face's own advance places them.
+            Some(Width::Missing) => {
+                let covered = self.code_to_ps_name(code).and_then(|name| self.coverage_advance_name(name));
+                Some(covered.filter(|_| self.missing_width == 0.0).unwrap_or(self.missing_width))
+            }
+            None => self.code_to_ps_name(code).and_then(|c| self.base_font.get_width(c).or_else(|| self.coverage_advance_name(c))),
         }
     }
 
@@ -636,6 +701,21 @@ impl StandardKind {
 /// PdfCraft patch: the first glyph id of the letters [`StandardKind`] builds from parts, far
 /// above the glyph count of any font (one id per character code from here).
 const COMPOSITE_GLYPH_BASE: u32 = 0x0100_0000;
+
+/// PdfCraft patch: glyph ids of characters drawn from the coverage face (Inter), above
+/// [`COMPOSITE_GLYPH_BASE`]. The code is in bits 16..24 and the coverage face's glyph id
+/// in the low 16 bits, so two codes that share a letter do not share an id.
+const COVERAGE_GLYPH_BASE: u32 = 0x0200_0000;
+
+/// A face for glyphs the standard stand-in does not have. Debug prints a label: the blob
+/// holds the font program, which is not itself `Debug`.
+struct CoverageFont(StandardFontBlob);
+
+impl std::fmt::Debug for CoverageFont {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CoverageFont")
+    }
+}
 
 /// PdfCraft patch: how far an accent raised over a capital moves right per unit of height in
 /// an italic stand-in (tan 15°; the standard italics lean 12° to 16°).

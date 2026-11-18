@@ -130,12 +130,24 @@ impl RenderConfig {
             annotation_overrides: self.annotations.clone(),
             appearance_overrides: self.appearances.clone(),
             font_resolver: Arc::new(move |query| {
-                japanese_fallback(query).or_else(|| system_fonts.then(|| system_fallback(query)).flatten()).or_else(|| standard(query))
+                coverage_font(query)
+                    .or_else(|| japanese_fallback(query))
+                    .or_else(|| system_fonts.then(|| system_fallback(query)).flatten())
+                    .or_else(|| standard(query))
             }),
             jbig2_work: self.jbig2_work.unwrap_or(defaults.jbig2_work),
             ..defaults
         }
     }
+}
+
+/// The bundled Inter face for characters a standard stand-in does not contain. A non-embedded
+/// Arial or Times that names Cyrillic with `afii…` in `/Differences` otherwise draws those
+/// letters blank (#2908). Bold stand-ins get the semibold cut. `None` for every other query.
+fn coverage_font(query: &FontQuery) -> Option<(FontData, u32)> {
+    let FontQuery::GlyphCoverage { bold } = query else { return None };
+    let bytes = pdfcraft_fonts::document_latin_fonts(*bold).first().map(|face| face.bytes)?;
+    Some((Arc::new(bytes.to_vec()), 0))
 }
 
 /// A Japanese face from craft-fonts for a CID font of the Adobe-Japan1 collection that the PDF
