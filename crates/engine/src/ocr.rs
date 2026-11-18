@@ -163,6 +163,17 @@ const ALREADY_ON_PAGE: f32 = 0.5;
 /// is a resolution on paper this size or smaller.
 const SHEET: f32 = 842.0;
 
+/// Dots per inch of a raster rendered at `scale` pixels per point of `page`.
+///
+/// A page larger than a sheet is measured as if shrunk onto one, the same fit
+/// [`OcrJob::render_scale`] uses. Otherwise a 300 dpi scan stored at one point per pixel
+/// looks like 72 dpi, and preprocessing (which brings anything under 300 dpi up to 300)
+/// enlarges it past the pixel cap and the page is skipped (#7678).
+fn preprocess_dpi(scale: f32, page: &PageInfo) -> f32 {
+    let fit = (SHEET / page.width.max(page.height).max(1e-3)).min(1.0);
+    if fit > 1e-3 { scale * 72.0 / fit } else { scale * 72.0 }
+}
+
 /// The text of `page`'s own: its glyphs, without the words drawn as outlines or pictures that only
 /// `/ActualText` names.
 pub(crate) fn own_text(r: &mut PageRenderer, page: usize) -> Result<pdfcraft_render::PageText, String> {
@@ -818,11 +829,12 @@ impl OcrSteps {
         };
         // Preprocessing sits between the page raster and recognition; its word boxes come
         // back in processed coordinates and are mapped to the ORIGINAL raster's before
-        // placement. The render dpi is the real one (pixels per point × 72), never a
-        // fixed value.
+        // placement. The dpi is the raster's against a sheet, not the page box: a scan whose
+        // box is one point per pixel (#1848) is already its own pixels, and calling that 72 dpi
+        // enlarges it past the pixel cap as soon as a preprocessing step is on (#7678).
         let pre = pdfcraft_ocr::preprocess::preprocess(
             image,
-            scale * 72.0,
+            preprocess_dpi(scale, &info),
             &pdfcraft_ocr::preprocess::PreprocessOptions {
                 auto_rotate: settings.auto_rotate,
                 deskew: settings.deskew,
@@ -2347,6 +2359,24 @@ mod tests {
                 assert!(near(shot.width, want[0]) && near(shot.height, want[1]), "{dpi} dpi, page {page}: {}x{}", shot.width, shot.height);
             }
         }
+    }
+
+    /// #7678: straightening a scan whose page box is one point per pixel must not enlarge that
+    /// raster to 300 dpi of the inflated box (past the 10 000-pixel side) and skip the page.
+    /// The pixels are already the scan; preprocessing reads them at the sheet's dpi.
+    #[test]
+    fn preprocessing_a_pixel_sized_scan_keeps_the_page() {
+        let mut s = Session::new();
+        let page = export::encode_png(2480, 3508, &vec![255; (2480 * 3508 * 4) as usize]).unwrap();
+        let bytes = s.create_from_images(&[("a4.png".into(), page)]).unwrap();
+        let id = s.open("scan.pdf", None, bytes, None).unwrap();
+        let job = s.ocr_job(id, &[0], OcrSettings { dpi: 300.0, deskew: true, ..Default::default() }).unwrap();
+        let mut steps = job.steps();
+        let prepared = steps.next_page().unwrap();
+        let mut shot = prepared.unwrap_or_else(|skipped| panic!("page skipped: {}", skipped.skipped.unwrap_or_default()));
+        let image = shot.take_image().expect("a raster");
+        assert!(image.width() <= 10_000 && image.height() <= 10_000, "{}x{}", image.width(), image.height());
+        assert!(image.width() < 4000 && image.height() < 5000, "not enlarged past the scan: {}x{}", image.width(), image.height());
     }
 
     /// The first and last letters of a line are read: ocrs' own 3-pixel margin clipped them at
