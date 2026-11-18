@@ -1821,7 +1821,7 @@ mod tests {
         };
         let focus = open_focus(&field, 0);
         assert_eq!(focus.text, "Строка 1\n\nСтрока 3\nещё");
-        assert!(draft_edit(&focus, &[field.clone()]).is_none(), "opening does not rewrite the value");
+        assert!(draft_edit(&focus, std::slice::from_ref(&field)).is_none(), "opening does not rewrite the value");
         let mut edited = focus;
         edited.text.push_str("\nконец");
         let Edit::SetFieldValue { value: FieldValue::Text(stored), .. } = draft_edit(&edited, &[field]).unwrap() else {
