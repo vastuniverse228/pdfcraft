@@ -100,12 +100,18 @@ fn bundled_in(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The directory Tesseract treats as the parent of `tessdata`, when that folder sits beside
-/// `program`. Derived from the program we already accepted, never from document data. Tesseract
-/// appends `tessdata` itself, so the value is the program's directory, not the data folder.
+/// The directory of the language files that sit beside `program` (`program/tessdata`).
+/// Derived from the program we already accepted, never from document data.
+///
+/// `TESSDATA_PREFIX` is that directory, not its parent. Tesseract opens
+/// `{prefix}/rus.traineddata` and `{prefix}/configs/tsv` (`ccutil.cpp` `main_setup`).
+/// The Windows build's own fallback, when the variable is unset, is `{exe}/tessdata`.
+/// Pointing the variable at the exe directory makes it look for
+/// `{exe}/rus.traineddata` and then print plain text, which this parser reads as no words.
 fn tessdata_prefix(program: &Path) -> Option<std::ffi::OsString> {
     let dir = program.parent()?;
-    dir.join("tessdata").is_dir().then(|| dir.as_os_str().to_os_string())
+    let data = dir.join("tessdata");
+    data.is_dir().then(|| data.into_os_string())
 }
 
 /// The first `tesseract` on the PATH that is an existing executable file. Entries that are not
@@ -193,6 +199,7 @@ fn tsv_row(row: &str) -> Option<TsvRow<'_>> {
     if c.len() < 12 {
         return None;
     }
+    let level = c[0].trim_start_matches('\u{feff}');
     let (block, par, line) = (c[2].trim().parse().ok()?, c[3].trim().parse().ok()?, c[4].trim().parse().ok()?);
     let (left, top): (f32, f32) = (c[6].trim().parse().ok()?, c[7].trim().parse().ok()?);
     let (width, height, conf): (f32, f32, f32) = (c[8].trim().parse().ok()?, c[9].trim().parse().ok()?, c[10].trim().parse().ok()?);
@@ -202,7 +209,29 @@ fn tsv_row(row: &str) -> Option<TsvRow<'_>> {
     if width < 0.0 || height < 0.0 {
         return None; // a word box has a non-negative size
     }
-    Some(TsvRow { level: c[0], block, par, line, left, top, width, height, conf, text: c[11] })
+    // A Windows TSV row ends in CR. Leaving it on the word keeps the letters but copies a
+    // carriage return; strip only that and a BOM, not the word's own spaces.
+    let text = c[11].trim_matches(|ch: char| ch == '\r' || ch == '\u{feff}');
+    Some(TsvRow { level, block, par, line, left, top, width, height, conf, text })
+}
+
+/// Bytes Tesseract wrote to the output file. Windows builds sometimes prefix UTF-8 with a BOM
+/// or write UTF-16 (the console's wide output) when stdout is a file. Either, read as raw
+/// UTF-8, drops every tab and the parser reports no words.
+fn decode_tesseract_output(bytes: &[u8]) -> String {
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16(rest, u16::from_le_bytes);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16(rest, u16::from_be_bytes);
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn decode_utf16(bytes: &[u8], order: impl Fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| order([pair[0], pair[1]])).collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// Parse `tesseract … tsv` output into lines of words. Rows with confidence −1 are the
@@ -461,7 +490,7 @@ impl TesseractCli {
             return Err(OcrError::OutputTooLarge(max_output));
         }
         let bytes = std::fs::read(&out_path).map_err(|e| OcrError::Process(format!("reading the output failed: {e}")))?;
-        Ok((String::from_utf8_lossy(&bytes).into_owned(), stderr))
+        Ok((decode_tesseract_output(&bytes), stderr))
     }
 
     /// Retry `--list-langs` once (an install may have appeared since the last try).
@@ -511,8 +540,11 @@ impl Recognizer for TesseractCli {
             set_private(&mut f);
             f.write_all(&png).map_err(|e| OcrError::Process(format!("writing the image failed: {e}")))?;
         }
-        // Fixed argv, no shell: tesseract <png> stdout -l <lang> tsv.
-        let tsv = self.run(&[&png_path.to_string_lossy(), "stdout", "-l", lang, "tsv"], self.timeout, self.max_output)?;
+        // Fixed argv, no shell. `-c tessedit_create_tsv=1` is the contents of the `tsv` config
+        // file. Asking for that file by name fails closed when `configs/` is not beside the
+        // traineddata: Tesseract then prints the words as plain text and this parser, seeing no
+        // TSV rows, reports an empty page.
+        let tsv = self.run(&[&png_path.to_string_lossy(), "stdout", "-l", lang, "-c", "tessedit_create_tsv=1"], self.timeout, self.max_output)?;
         let (lines, truncated) = parse_tsv_bounded(&tsv);
         if truncated {
             return Err(OcrError::Recognize(format!("the {MAX_WORDS}-word limit was exceeded; the incomplete reading was rejected")));
@@ -637,6 +669,46 @@ mod tests {
         assert_eq!(lines[1].words.len(), 1, "a new par starts a new line");
         assert_eq!(lines[1].words[0].text, "second");
         assert_eq!(lines[1].words[0].confidence, Some(42.123));
+    }
+
+    /// The three lines a Windows Tesseract read from a Russian page, as that build writes them:
+    /// UTF-8 with a BOM and CRLF. The same bytes as UTF-16 LE (a redirected Windows stdout)
+    /// decode to the same words. Without that decode every tab is lost and the page is empty.
+    #[test]
+    fn a_windows_tsv_keeps_the_russian_lines() {
+        let crlf = russian_page_tsv();
+        let with_bom = format!("\u{feff}{crlf}");
+        assert_eq!(words_of(&parse_tsv(&with_bom)), RUSSIAN_PAGE);
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in with_bom.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(words_of(&parse_tsv(&decode_tesseract_output(&utf16))), RUSSIAN_PAGE);
+        // Reading the UTF-16 bytes as UTF-8 drops the tabs, so the page comes back empty.
+        assert!(parse_tsv(&String::from_utf8_lossy(&utf16)).is_empty());
+    }
+
+    const RUSSIAN_PAGE: &[&str] = &["Привет,", "мир.", "Это", "проверка", "русского", "распознавания.", "PdfCraft", "OCR", "2026"];
+
+    fn russian_page_tsv() -> String {
+        [
+            "level\tpage\tblock\tpar\tline\tword\tleft\ttop\twidth\theight\tconf\ttext",
+            "5\t1\t1\t1\t1\t1\t10\t10\t80\t12\t96.0\tПривет,",
+            "5\t1\t1\t1\t1\t2\t95\t10\t40\t12\t95.0\tмир.",
+            "5\t1\t1\t1\t2\t1\t10\t30\t40\t12\t94.0\tЭто",
+            "5\t1\t1\t1\t2\t2\t55\t30\t80\t12\t93.0\tпроверка",
+            "5\t1\t1\t1\t2\t3\t140\t30\t90\t12\t92.0\tрусского",
+            "5\t1\t1\t1\t2\t4\t235\t30\t130\t12\t91.0\tраспознавания.",
+            "5\t1\t1\t1\t3\t1\t10\t50\t80\t12\t90.0\tPdfCraft",
+            "5\t1\t1\t1\t3\t2\t95\t50\t40\t12\t89.0\tOCR",
+            "5\t1\t1\t1\t3\t3\t140\t50\t50\t12\t88.0\t2026",
+        ]
+        .join("\r\n")
+            + "\r\n"
+    }
+
+    fn words_of(lines: &[Line]) -> Vec<&str> {
+        lines.iter().flat_map(|line| line.words.iter().map(|word| word.text.as_str())).collect()
     }
 
     /// Conf −1 rows and level ≠ 5 rows are structure, not words; blank text is dropped.
@@ -953,6 +1025,26 @@ $n = [PdfCraftOcrProbe.Console]::GetConsoleProcessList($ids, 256)
         assert!(!attached.is_empty() && !attached.contains(&std::process::id()), "the program shares this process's console: {text}");
     }
 
+    /// A stand-in for the Windows portable tesseract: it writes the CRLF UTF-8 TSV of the
+    /// Russian page, and `recognize` reads those three lines back.
+    #[cfg(unix)]
+    #[test]
+    fn recognize_reads_a_windows_crlf_utf8_tsv() {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-ocr-win-tsv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reading = dir.join("reading.tsv");
+        std::fs::write(&reading, format!("\u{feff}{}", russian_page_tsv())).unwrap();
+        let script = dir.join("tesseract-win");
+        std::fs::write(&script, "#!/bin/sh\ncat \"$(dirname \"$0\")/reading.tsv\"\n").unwrap();
+        make_executable(&script);
+        let t = TesseractCli::new(script);
+        let lines = t.recognize(&blot(8, 8, 0, 0, 4, 4), &RecognizeOptions::default()).unwrap();
+        assert_eq!(words_of(&lines), RUSSIAN_PAGE);
+        assert_eq!(lines.len(), 3, "three text lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     fn make_executable(p: &Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -1034,7 +1126,8 @@ $n = [PdfCraftOcrProbe.Console]::GetConsoleProcessList($ids, 256)
             let _ = std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755));
         }
         assert_eq!(bundled_in(&root).as_deref(), Some(program.as_path()));
-        assert_eq!(tessdata_prefix(&program).as_deref(), Some(nested.as_os_str()));
+        let data = nested.join("tessdata");
+        assert_eq!(tessdata_prefix(&program).as_deref(), Some(data.as_os_str()), "the prefix is the tessdata folder, not the exe folder");
         // A program sitting directly beside the app (no tessdata folder). On Unix that file
         // is named `tesseract`, which is also the nested directory, so this case uses its
         // own root.
