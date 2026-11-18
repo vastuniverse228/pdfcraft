@@ -294,15 +294,14 @@ fn reference_loops_terminate_and_a_delete_takes_the_cycle_with_it() {
 // ── wrong types where the reader wants a number or a name ─────────────────────────────────────
 
 /// Values of the wrong type in flag, opacity and colour entries: the reader falls back to its
-/// defaults instead of panicking. NOTE on opacity: reading does **not** clamp, so `/CA 7.5` comes
-/// back as 7.5 and would hand a nonsense value to a 0–1 slider; writing clamps (`add_annotation`
-/// refuses non-finite and clamps the range). The asymmetry is recorded here, not endorsed.
+/// defaults instead of panicking. Opacity is read through `part_opacity`, which clamps a finite
+/// `/CA` into 0–1, so `/CA 7.5` comes back as 1.0. Writing still refuses a non-finite opacity.
 #[test]
 fn wrong_typed_flag_opacity_and_colour_entries_fall_back_without_panicking() {
     let doc = one_annot(b"<< /Type /Annot /Subtype /Text /Rect [10 20 30 40] /CA 7.5 /F /NotAnInt /C [1 2] >>");
     read_everything(&doc);
     let p = props(&doc, 0, 0).expect("still a comment");
-    assert_eq!(p.opacity, 7.5, "the out-of-range opacity is passed through as written");
+    assert_eq!(p.opacity, 1.0, "an out-of-range opacity is clamped into 0–1");
     assert!(!p.locked, "a name where /F belongs reads as no flags at all");
     assert_eq!(p.color, None, "/C with two components is not a colour");
     let listed = summaries(&doc);
