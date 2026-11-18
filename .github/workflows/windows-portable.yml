@@ -92,9 +92,24 @@ jobs:
           if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() -ne 'c885fff6998e0608ba4bb8ab51436e1c6775c2bafc2559a19b423e18678b60c9') {
             throw 'tesseract installer hash mismatch'
           }
-          $install = Join-Path $env:RUNNER_TEMP 'tess-install'
-          cmd.exe /c "`"$setup`" /S /D=$install"
-          if (-not (Test-Path (Join-Path $install 'tesseract.exe'))) { throw 'tesseract installer did not produce tesseract.exe' }
+          # A short path with no spaces. NSIS reads /D= only when it is last and unquoted;
+          # quoting it made the silent install exit without writing tesseract.exe.
+          $install = 'C:\tess'
+          if (Test-Path $install) { Remove-Item -Recurse -Force $install }
+          cmd.exe /c "$setup /S /D=$install"
+          $exe = Join-Path $install 'tesseract.exe'
+          if (-not (Test-Path $exe)) {
+            $fallback = @(
+              'C:\Program Files\Tesseract-OCR\tesseract.exe',
+              'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($fallback) { $install = Split-Path $fallback; $exe = $fallback }
+          }
+          if (-not (Test-Path $exe)) {
+            Write-Host 'tesseract install directory:'
+            if (Test-Path $install) { Get-ChildItem $install -Recurse -ErrorAction SilentlyContinue | Select-Object -First 40 | ForEach-Object { $_.FullName } }
+            throw 'tesseract installer did not produce tesseract.exe'
+          }
           $tess = Join-Path $stage 'tesseract'
           New-Item -ItemType Directory -Force -Path (Join-Path $tess 'tessdata') | Out-Null
           Copy-Item (Join-Path $install 'tesseract.exe') $tess

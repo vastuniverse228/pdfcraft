@@ -293,7 +293,7 @@ fn main() -> eframe::Result {
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             eframe::run_native(
                 "PdfCraft",
-                native_options_for(launch.integrated, launch.window_controls.is_some(), renderer, backends),
+                native_options(launch.integrated, launch.window_controls.is_some(), renderer, backends),
                 app_creator(
                     launch.clone(),
                     Rc::clone(&started),
@@ -377,19 +377,9 @@ fn startup_attempts(choice: RendererChoice, windows: bool) -> Vec<GpuAttempt> {
     }
 }
 
-/// The window and renderer settings for one run.
-fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer) -> eframe::NativeOptions {
-    native_options_for(integrated, app_frame, renderer, None)
-}
-
-/// [`native_options`] with an explicit wgpu backend for one startup try. `None` keeps the
-/// Windows default (Direct3D 12 and wgpu's OpenGL, not Vulkan).
-fn native_options_for(
-    integrated: bool,
-    app_frame: bool,
-    renderer: eframe::Renderer,
-    backends: Option<eframe::wgpu::Backends>,
-) -> eframe::NativeOptions {
+/// The window and renderer settings for one run. `backends` is the Windows wgpu try
+/// (`None` keeps Direct3D 12 and wgpu's OpenGL, not Vulkan).
+fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer, backends: Option<eframe::wgpu::Backends>) -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PdfCraft")
         .with_inner_size([1440.0, 920.0])
@@ -424,7 +414,7 @@ fn native_options_for(
     // provider would read every installed face, including proprietary ones, into every UI pass.
     native.system_font_fallback = false;
     if renderer == eframe::Renderer::Wgpu {
-        configure_gpu_with(&mut native, backends);
+        configure_gpu(&mut native, backends);
     }
     native
 }
@@ -775,11 +765,7 @@ fn stage_control_file(
 ///   is being resized, Windows stretched the window's swap chain, still at the old size, to the
 ///   new one, so the text shimmered and the left panel's width bounced for as long as the drag
 ///   lasted (issue #2738). A visual's last frame is shown at its own size instead.
-fn configure_gpu(native: &mut eframe::NativeOptions) {
-    configure_gpu_with(native, None);
-}
-
-fn configure_gpu_with(native: &mut eframe::NativeOptions, backends: Option<eframe::wgpu::Backends>) {
+fn configure_gpu(native: &mut eframe::NativeOptions, backends: Option<eframe::wgpu::Backends>) {
     // Used on Windows only; other targets keep eframe's backend list.
     let _requested = backends;
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup else { return };
