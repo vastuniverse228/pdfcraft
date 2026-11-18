@@ -125,6 +125,19 @@ fn opengl_is_the_fallback_unless_a_renderer_was_chosen() {
     assert!(!retry_with_gl(RendererChoice::Auto, true));
     assert!(!retry_with_gl(RendererChoice::Wgpu, false));
     assert!(!retry_with_gl(RendererChoice::Gl, false));
+    // Windows Automatic: Direct3D 12, then Vulkan, then OpenGL. Vulkan is not in the first instance.
+    let windows = super::startup_attempts(RendererChoice::Auto, true);
+    assert_eq!(
+        windows,
+        vec![
+            super::GpuAttempt::Wgpu(Some(eframe::wgpu::Backends::DX12)),
+            super::GpuAttempt::Wgpu(Some(eframe::wgpu::Backends::VULKAN)),
+            super::GpuAttempt::Glow,
+        ]
+    );
+    assert_eq!(super::startup_attempts(RendererChoice::Wgpu, true), vec![super::GpuAttempt::Wgpu(None)]);
+    assert_eq!(super::startup_attempts(RendererChoice::Gl, true), vec![super::GpuAttempt::Glow]);
+    assert_eq!(super::startup_attempts(RendererChoice::Auto, false), vec![super::GpuAttempt::Wgpu(None), super::GpuAttempt::Glow]);
     // Each run states its renderer rather than relying on eframe's default.
     assert_eq!(native_options(false, false, eframe::Renderer::Wgpu).renderer, eframe::Renderer::Wgpu);
     assert_eq!(native_options(false, false, eframe::Renderer::Glow).renderer, eframe::Renderer::Glow);

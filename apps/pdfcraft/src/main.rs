@@ -282,39 +282,51 @@ fn main() -> eframe::Result {
     let apple_events = apple_events::AppleEvents::install();
     // Set once the app is created, which is after the renderer has started.
     let started = Rc::new(Cell::new(false));
-    let first = if choice == RendererChoice::Gl { eframe::Renderer::Glow } else { eframe::Renderer::Wgpu };
-    let result = eframe::run_native(
-        "PdfCraft",
-        native_options(launch.integrated, launch.window_controls.is_some(), first),
-        app_creator(
-            launch.clone(),
-            Rc::clone(&started),
-            instance.as_ref(),
-            #[cfg(target_os = "macos")]
-            &apple_events,
-        ),
-    );
-    match result {
-        // Only a renderer that couldn't start: without a window or display at all, OpenGL can't
-        // help either, and winit's own error says more.
-        Err(e @ eframe::Error::Wgpu(_)) if retry_with_gl(choice, started.get()) => {
-            // Old or unusual GPUs and drivers (#461, #435, #392) can't give wgpu a device; OpenGL
-            // usually still works there, so that's better than quitting.
-            log::error!("the GPU renderer (wgpu) didn't start: {e}. Starting with OpenGL instead; set PDFCRAFT_RENDERER=gl to skip wgpu.");
+    let attempts = startup_attempts(choice, cfg!(target_os = "windows"));
+    let mut reported = None;
+    let mut panicked = None;
+    for attempt in attempts {
+        let (renderer, backends) = match attempt {
+            GpuAttempt::Glow => (eframe::Renderer::Glow, None),
+            GpuAttempt::Wgpu(backends) => (eframe::Renderer::Wgpu, backends),
+        };
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             eframe::run_native(
                 "PdfCraft",
-                native_options(launch.integrated, launch.window_controls.is_some(), eframe::Renderer::Glow),
+                native_options_for(launch.integrated, launch.window_controls.is_some(), renderer, backends),
                 app_creator(
-                    launch,
-                    started,
+                    launch.clone(),
+                    Rc::clone(&started),
                     instance.as_ref(),
                     #[cfg(target_os = "macos")]
                     &apple_events,
                 ),
             )
+        }));
+        match run {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) if retry_with_gl(choice, started.get()) => {
+                log::error!("renderer {renderer:?} didn't start: {e}. Trying the next one.");
+                reported = Some(e);
+            }
+            Ok(other) => return other,
+            // A Rust panic while the window is still unopened (a DX12 shader failure, or an
+            // overlay hook that wgpu turns into a panic) tries the next backend. A panic after
+            // the app exists is the app's own, and is not restarted.
+            Err(payload) if retry_with_gl(choice, started.get()) => {
+                log::error!("renderer {renderer:?} panicked before the window opened; trying the next one");
+                panicked = Some(payload);
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
         }
-        other => other,
     }
+    if let Some(error) = reported {
+        return Err(error);
+    }
+    if let Some(payload) = panicked {
+        std::panic::resume_unwind(payload);
+    }
+    Ok(())
 }
 
 /// Which renderer to start with, from `PDFCRAFT_RENDERER`.
@@ -336,14 +348,48 @@ fn renderer_choice(value: Option<&str>) -> RendererChoice {
     }
 }
 
-/// Whether a failed run should be retried with OpenGL: only when wgpu was tried first by choice of
-/// nobody, and it failed before the app was created (so while starting the renderer, not later).
+/// Whether a failed run should try the next renderer: only when nothing was chosen, and it
+/// failed before the app was created (so while starting the renderer, not later).
 fn retry_with_gl(choice: RendererChoice, app_started: bool) -> bool {
     choice == RendererChoice::Auto && !app_started
 }
 
+/// One startup try. On Windows, Automatic is Direct3D 12, then Vulkan, then OpenGL.
+/// Vulkan is its own try, not loaded beside Direct3D 12: creating a Vulkan instance loads
+/// every installed Vulkan driver, and a faulty Intel one crashed the process before the
+/// window appeared (#37). A hybrid RTX laptop whose Direct3D 12 device fails (an overlay
+/// such as MSI Afterburner / RTSS, #7626, or a shader the driver rejects) still gets Vulkan
+/// and then OpenGL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuAttempt {
+    Wgpu(Option<eframe::wgpu::Backends>),
+    Glow,
+}
+
+fn startup_attempts(choice: RendererChoice, windows: bool) -> Vec<GpuAttempt> {
+    match choice {
+        RendererChoice::Gl => vec![GpuAttempt::Glow],
+        RendererChoice::Wgpu => vec![GpuAttempt::Wgpu(None)],
+        RendererChoice::Auto if windows => {
+            vec![GpuAttempt::Wgpu(Some(eframe::wgpu::Backends::DX12)), GpuAttempt::Wgpu(Some(eframe::wgpu::Backends::VULKAN)), GpuAttempt::Glow]
+        }
+        RendererChoice::Auto => vec![GpuAttempt::Wgpu(None), GpuAttempt::Glow],
+    }
+}
+
 /// The window and renderer settings for one run.
 fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer) -> eframe::NativeOptions {
+    native_options_for(integrated, app_frame, renderer, None)
+}
+
+/// [`native_options`] with an explicit wgpu backend for one startup try. `None` keeps the
+/// Windows default (Direct3D 12 and wgpu's OpenGL, not Vulkan).
+fn native_options_for(
+    integrated: bool,
+    app_frame: bool,
+    renderer: eframe::Renderer,
+    backends: Option<eframe::wgpu::Backends>,
+) -> eframe::NativeOptions {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PdfCraft")
         .with_inner_size([1440.0, 920.0])
@@ -378,7 +424,7 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
     // provider would read every installed face, including proprietary ones, into every UI pass.
     native.system_font_fallback = false;
     if renderer == eframe::Renderer::Wgpu {
-        configure_gpu(&mut native);
+        configure_gpu_with(&mut native, backends);
     }
     native
 }
@@ -512,6 +558,15 @@ fn app_creator<'a>(
         // The OCR Verify screen stores its per-language dictionary beside recovery data.
         app.ocr_verify.dictionary_dir = pdfcraft_ui_egui::default_dictionary_dir();
         if let Some(state) = &cc.wgpu_render_state {
+            // wgpu treats an uncaptured error or a lost device as fatal. An overlay
+            // (MSI Afterburner / RTSS, #7626) can cause either after the window exists.
+            // Log them and leave the process running.
+            state.device.set_device_lost_callback(|reason, message| {
+                log::error!("GPU device lost ({reason:?}): {message}. An overlay such as MSI Afterburner can cause this; PdfCraft stays open.");
+            });
+            state.device.on_uncaptured_error(std::sync::Arc::new(|error| {
+                log::error!("GPU error (the app stays open; an overlay can cause this): {error}");
+            }));
             let adapter = state.adapter.get_info();
             let max_texture_dimension_2d = state.device.limits().max_texture_dimension_2d;
             log::info!(
@@ -710,16 +765,23 @@ fn stage_control_file(
 ///   says which one it is ([`compositor_gpu::compositor_gpu`]), and frames from another GPU may
 ///   never reach the screen, even from the GPU behind the built-in panel when the compositor runs
 ///   on the discrete one.
-/// - On Windows, use Direct3D 12, falling back to OpenGL, and never load Vulkan drivers unless
-///   `WGPU_BACKEND` asks for them. Creating a Vulkan instance loads every installed Vulkan driver
-///   into the process, and a faulty one (an Intel driver in issue #37) crashed PdfCraft before
-///   its window appeared. D3D12 is the native, best-supported backend there.
+/// - On Windows, the first try is Direct3D 12 alone. Vulkan is the next try, not a backend of
+///   the same instance: creating a Vulkan instance loads every installed Vulkan driver, and a
+///   faulty Intel one crashed PdfCraft before its window appeared (#37). A hybrid laptop whose
+///   Direct3D 12 device fails (RTX 4060 plus an Intel iGPU, or an overlay such as MSI
+///   Afterburner / RTSS, #7626) still reaches Vulkan and then OpenGL. `WGPU_BACKEND` still wins.
 /// - On Windows, Direct3D 12 presents through a DirectComposition visual rather than a swap chain
 ///   on the window itself, unless `WGPU_DX12_PRESENTATION_SYSTEM` says otherwise. While the window
 ///   is being resized, Windows stretched the window's swap chain, still at the old size, to the
 ///   new one, so the text shimmered and the left panel's width bounced for as long as the drag
 ///   lasted (issue #2738). A visual's last frame is shown at its own size instead.
 fn configure_gpu(native: &mut eframe::NativeOptions) {
+    configure_gpu_with(native, None);
+}
+
+fn configure_gpu_with(native: &mut eframe::NativeOptions, backends: Option<eframe::wgpu::Backends>) {
+    // Used on Windows only; other targets keep eframe's backend list.
+    let _requested = backends;
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut native.wgpu_options.wgpu_setup else { return };
     // Nothing draws or dispatches indirectly, so wgpu's check of indirect arguments only costs a
     // compute shader when the device is created, one that Metal can't compile on an Intel Iris
@@ -764,7 +826,9 @@ fn configure_gpu(native: &mut eframe::NativeOptions) {
         }
     }
     if cfg!(target_os = "windows") && std::env::var_os("WGPU_BACKEND").is_none() {
-        setup.instance_descriptor.backends = eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL;
+        // Direct3D 12 by itself. Vulkan is a later try (`startup_attempts`), so this instance
+        // does not load every Vulkan driver (#37). An explicit attempt passes its own backend.
+        setup.instance_descriptor.backends = _requested.unwrap_or(eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL);
     }
     if cfg!(target_os = "windows") {
         setup.instance_descriptor.backend_options.dx12.presentation_system = dx12_presentation(eframe::wgpu::Dx12SwapchainKind::from_env());
