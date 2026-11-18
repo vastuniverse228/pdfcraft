@@ -3,6 +3,8 @@
 # toolchain. This workflow builds the x64 GUI and CLI on windows-latest and
 # uploads that zip. It does not sign the binaries and it does not embed
 # craft-fonts (Japanese stays a replacement box until a release build).
+# It does ship the Latin OCR models and a Tesseract build with rus+eng,
+# so Russian recognition works offline.
 name: Windows portable
 
 on:
@@ -17,7 +19,9 @@ permissions:
 
 concurrency:
   group: windows-portable-${{ github.ref }}
-  cancel-in-progress: true
+  # Each push should finish its own zip. Cancelling the previous run drops
+  # the artifact the previous commit was meant to publish.
+  cancel-in-progress: false
 
 jobs:
   portable:
@@ -35,6 +39,9 @@ jobs:
           $env:PDFCRAFT_REQUIRE_WINRES = '1'
           $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C target-feature=+crt-static'
           cargo build --release --locked -p pdfcraft -p pdfcraft-cli --target x86_64-pc-windows-msvc
+      - name: Fetch the OCR models
+        shell: pwsh
+        run: cargo xtask models (Join-Path $env:RUNNER_TEMP 'ocr-models')
       - name: Pack the portable zip
         shell: pwsh
         run: |
@@ -58,6 +65,47 @@ jobs:
           }
           # Keeps settings, logs and recovery beside the exe instead of AppData.
           Set-Content -Path (Join-Path $stage 'portable.txt') -Value "PdfCraft portable`n" -Encoding ascii
+          $models = Join-Path $env:RUNNER_TEMP 'ocr-models'
+          foreach ($model in 'text-detection.onnx', 'text-recognition.onnx', 'ATTRIBUTION.txt') {
+            if (-not (Test-Path (Join-Path $models $model))) { throw "missing OCR model $model" }
+          }
+          Copy-Item -Recurse $models (Join-Path $stage 'models')
+          # UB-Mannheim's Apache-2.0 Windows build, pinned by SHA-256. Silent NSIS install,
+          # then only the program, its DLLs and the tsv config. rus+eng come from tessdata_fast
+          # at a pinned commit, also hashed, so the zip does not depend on the installer's pack.
+          $setup = Join-Path $env:RUNNER_TEMP 'tesseract-setup.exe'
+          Invoke-WebRequest -Uri 'https://github.com/UB-Mannheim/tesseract/releases/download/v5.4.0.20240606/tesseract-ocr-w64-setup-5.4.0.20240606.exe' -OutFile $setup
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() -ne 'c885fff6998e0608ba4bb8ab51436e1c6775c2bafc2559a19b423e18678b60c9') {
+            throw 'tesseract installer hash mismatch'
+          }
+          $install = Join-Path $env:RUNNER_TEMP 'tess-install'
+          cmd.exe /c "`"$setup`" /S /D=$install"
+          if (-not (Test-Path (Join-Path $install 'tesseract.exe'))) { throw 'tesseract installer did not produce tesseract.exe' }
+          $tess = Join-Path $stage 'tesseract'
+          New-Item -ItemType Directory -Force -Path (Join-Path $tess 'tessdata') | Out-Null
+          Copy-Item (Join-Path $install 'tesseract.exe') $tess
+          Copy-Item (Join-Path $install '*.dll') $tess
+          if (-not (Get-ChildItem (Join-Path $tess '*.dll'))) { throw 'tesseract install has no DLLs' }
+          if (Test-Path (Join-Path $install 'tessdata\configs')) {
+            Copy-Item -Recurse (Join-Path $install 'tessdata\configs') (Join-Path $tess 'tessdata\configs')
+          }
+          $packs = @{
+            'rus.traineddata' = 'e16e5e036cce1d9ec2b00063cf8b54472625b9e14d893a169e2b0dedeb4df225'
+            'eng.traineddata' = '7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2'
+          }
+          $tessdataCommit = '87416418657359cb625c412a48b6e1d6d41c29bd'
+          foreach ($name in $packs.Keys) {
+            $out = Join-Path $tess "tessdata\$name"
+            Invoke-WebRequest -Uri "https://github.com/tesseract-ocr/tessdata_fast/raw/$tessdataCommit/$name" -OutFile $out
+            if ((Get-FileHash $out -Algorithm SHA256).Hash.ToLower() -ne $packs[$name]) { throw "$name hash mismatch" }
+          }
+          @(
+            'Tesseract OCR (Apache-2.0), Windows build by UB Mannheim.',
+            'Installer: https://github.com/UB-Mannheim/tesseract/releases/tag/v5.4.0.20240606',
+            'SHA-256: c885fff6998e0608ba4bb8ab51436e1c6775c2bafc2559a19b423e18678b60c9',
+            "rus.traineddata and eng.traineddata: https://github.com/tesseract-ocr/tessdata_fast/tree/$tessdataCommit",
+            'The app looks for tesseract\tesseract.exe and tesseract\tessdata beside pdfcraft.exe.'
+          ) | Set-Content -Path (Join-Path $tess 'NOTICE.txt') -Encoding ascii
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $zip = "dist\pdfcraft-$version-windows-x64-portable.zip"
           if (Test-Path $zip) { Remove-Item $zip }

@@ -1455,7 +1455,7 @@ fn toolbar(app: &mut PdfCraftApp, ui: &mut egui::Ui, n: &mut Intents) {
     // Row 1: the settings (each written back into the persisted draft).
     ui.horizontal_wrapped(|ui| {
         craft_ui::ComboBox::from_id_salt("ocr-verify-language").width(150.0).selected_text(language_name(&d.language)).show_ui(ui, |ui| {
-            for (code, name) in pdfcraft_engine::ocr::LANGUAGES {
+            for (code, name) in pdfcraft_engine::ocr::DOCUMENT_LANGUAGES {
                 ui.selectable_value(&mut d.language, (*code).to_string(), *name);
             }
         });
@@ -1533,7 +1533,7 @@ fn toolbar(app: &mut PdfCraftApp, ui: &mut egui::Ui, n: &mut Intents) {
 
 /// A language code's dropdown text: its name and its code ("English (en)").
 fn language_name(code: &str) -> String {
-    pdfcraft_engine::ocr::LANGUAGES.iter().find(|l| l.0 == code).map_or_else(|| code.to_owned(), |l| format!("{} ({})", l.1, l.0))
+    pdfcraft_engine::ocr::DOCUMENT_LANGUAGES.iter().find(|l| l.0 == code).map_or_else(|| code.to_owned(), |l| format!("{} ({})", l.1, l.0))
 }
 
 /// The Engine dropdown's text.

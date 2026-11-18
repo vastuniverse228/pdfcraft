@@ -85,10 +85,10 @@ fn schema(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required, "additionalProperties": false })
 }
 
-/// The language codes the engines read, as the `language` enum — from the engine's own table,
-/// so the schema and the validator can never disagree.
+/// The language codes recognition accepts, as the `language` enum — from the engine's own
+/// table, so the schema and the validator can never disagree.
 fn language_enum() -> Value {
-    Value::Array(pdfcraft_engine::ocr::LANGUAGES.iter().map(|(code, _)| json!(code)).collect())
+    Value::Array(pdfcraft_engine::ocr::DOCUMENT_LANGUAGES.iter().map(|(code, _)| json!(code)).collect())
 }
 
 struct T {

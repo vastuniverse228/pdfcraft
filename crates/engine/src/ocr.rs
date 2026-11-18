@@ -15,8 +15,8 @@ use pdfcraft_render::text::TextFilter;
 use pdfcraft_render::{PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
 pub use pdfcraft_ocr::{
-    ConfidenceBand, DETECTION_MODEL, LANGUAGES, Line, MergeStrategy, Models, Ocr, OcrError, OcrImage, PlacedWord, RECOGNITION_MODEL, Recognizer,
-    StrategyOutcome, Word, band_for, is_suspect, lines_from_json, low_confidence,
+    ConfidenceBand, DETECTION_MODEL, DOCUMENT_LANGUAGES, LANGUAGES, Line, MergeStrategy, Models, Ocr, OcrError, OcrImage, PlacedWord,
+    RECOGNITION_MODEL, Recognizer, StrategyOutcome, Word, band_for, builtin_reads, is_suspect, lines_from_json, low_confidence,
 };
 
 use crate::{DocId, Edit, EditError, Session};
@@ -548,12 +548,19 @@ fn configured_tesseract(settings: &OcrSettings) -> Option<String> {
 /// cannot start fails with its cause named.
 pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
     // The Tesseract probe (a `--list-langs` process) runs before any static mutex is taken, so
-    // recognition on other threads is never blocked behind someone's discovery. A job that
-    // names its engines never starts it: only Tesseract and Automatic read anything from it,
-    // so an ocrs-only job pays no process and no wait.
+    // recognition on other threads is never blocked behind someone's discovery. An English
+    // ocrs-only job never starts it. A non-English job does, because the built-in models
+    // cannot read that language.
     let configured = configured_tesseract(settings);
-    let tesseract =
-        if matches!(settings.engine, EngineChoice::Tesseract | EngineChoice::Auto) { tesseract_engine(configured.as_deref()) } else { None };
+    // The built-in models read English only. A Russian (or other non-English) job stays on
+    // them only when Tesseract is absent, and then the error names why: Latin look-alikes
+    // would copy as the wrong letters (#4160).
+    let needs_tesseract = !builtin_reads(&settings.language);
+    let tesseract = if needs_tesseract || matches!(settings.engine, EngineChoice::Tesseract | EngineChoice::Auto) {
+        tesseract_engine(configured.as_deref())
+    } else {
+        None
+    };
     let mut slot = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
     let cache = slot.get_or_insert_with(|| EngineCache { ocrs: None });
     if cache.ocrs.is_none() {
@@ -561,6 +568,16 @@ pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
         cache.ocrs = pdfcraft_ocr::OcrsRecognizer::find().ok().map(|r| Arc::new(r) as Arc<dyn Recognizer>);
     }
     let ocrs = cache.ocrs.clone();
+    if needs_tesseract {
+        let primary = tesseract.ok_or_else(|| {
+            format!(
+                "{}; the built-in models read English only, so {} needs tesseract and its traineddata",
+                tesseract_unavailable(),
+                settings.language
+            )
+        })?;
+        return Ok(Recognizers { primary, secondary: None });
+    }
     match settings.engine {
         EngineChoice::Ocrs => Ok(Recognizers { primary: ocrs.ok_or_else(models_missing)?, secondary: None }),
         EngineChoice::Tesseract => Ok(Recognizers { primary: tesseract.ok_or_else(tesseract_unavailable)?, secondary: None }),
@@ -575,7 +592,7 @@ pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
 /// Why Tesseract cannot run, named for the user.
 #[cfg(not(target_arch = "wasm32"))]
 fn tesseract_unavailable() -> String {
-    "the tesseract program was not found (install it, or add it to the PATH)".into()
+    "the tesseract program was not found (install it, add it to the PATH, or place it beside the app with a tessdata folder)".into()
 }
 
 /// Why Tesseract cannot run, named for the user (the web build has no processes).
@@ -1734,6 +1751,16 @@ mod tests {
         let wants = OcrSettings { engine: EngineChoice::Tesseract, tesseract_path: Some(program), ..Default::default() };
         let _ = recognizers(&wants);
         assert!(marker.exists(), "a tesseract job probes its program");
+
+        // Russian is not in the built-in alphabet, so an ocrs choice still looks for tesseract
+        // and refuses to write Latin look-alikes when that program cannot run.
+        let (marker, program) = probe("russian");
+        let russian = OcrSettings { engine: EngineChoice::Ocrs, language: "ru".into(), tesseract_path: Some(program), ..Default::default() };
+        let Err(err) = recognizers(&russian) else {
+            panic!("a dead tesseract is not a Russian reader");
+        };
+        assert!(marker.exists(), "a Russian job probes tesseract even when the choice says ocrs");
+        assert!(err.contains("tesseract") && err.contains("ru"), "{err}");
     }
 
     /// A fake engine for the batch skip logic: reads one confident word from anything, counts
@@ -2146,11 +2173,27 @@ mod tests {
         let mut out = Session::new();
         let oid = out.open("ocr.pdf", None, bytes, None).unwrap();
         let text = crate::tests::page_texts(&out, oid)[0].clone();
-        if pdfcraft_fonts::CRAFT_FONTS.is_empty() {
-            assert!(text.contains("??????"), "{text}");
-        } else {
-            assert!(text.contains("Привет"), "{text}");
-        }
+        assert!(text.contains("Привет"), "the editable layer copies the Cyrillic letters: {text}");
+    }
+
+    /// The searchable layer's ToUnicode map keeps a recognized Russian word, with or without
+    /// craft-fonts (#4160).
+    #[test]
+    fn searchable_layer_round_trips_russian() {
+        let mut s = Session::new().with_clock(|| 1_700_000_000);
+        let id = s.open("src.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let word = PlacedWord {
+            text: "Привет".into(),
+            origin: [20.0, 250.0],
+            across: [80.0, 0.0],
+            up: [0.0, 10.0],
+            confidence: None,
+            source: "tesseract".into(),
+        };
+        s.apply(id, Edit::AddOcrText { page: 0, words: vec![word] }).unwrap();
+        let text = crate::tests::page_texts(&s, id)[0].clone();
+        assert!(text.contains("Привет"), "{text}");
+        assert!(!text.contains('?'), "{text}");
     }
 
     /// The editable output's VISIBLE layer — a Type3 run for the Cyrillic word, Helvetica for
@@ -2159,10 +2202,6 @@ mod tests {
     /// the Latin word elsewhere on the page stays.
     #[test]
     fn the_editable_type3_layer_is_redacted_end_to_end() {
-        if pdfcraft_fonts::CRAFT_FONTS.is_empty() {
-            eprintln!("skipping: built without craft-fonts (set CRAFT_FONTS_DIR to run it)");
-            return;
-        }
         let mut s = Session::new().with_clock(|| 1_700_000_000);
         let id = s.open("src.pdf", None, Arc::new(fixture(1)), None).unwrap();
         let word = |text: &str, y: f64, w: f64| PlacedWord {

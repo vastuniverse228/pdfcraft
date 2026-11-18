@@ -1,12 +1,13 @@
-//! The Tesseract engine: an installed `tesseract` binary driven as an optional external
-//! process (`tesseract <png> stdout -l <lang> tsv`), never linked, never bundled, never
-//! downloaded. The whole module is compiled out for wasm32, where nothing may spawn.
+//! The Tesseract engine: a `tesseract` binary driven as an optional external process
+//! (`tesseract <png> stdout -l <lang> tsv`), never linked and never downloaded by this crate.
+//! A portable package may place one beside this executable; otherwise it is found on the PATH.
+//! The whole module is compiled out for wasm32, where nothing may spawn.
 //!
-//! Security posture (hard rules): the program path comes from the PATH or a user-configured
-//! location, never from document data; the language code is allow-listed before it reaches a
-//! process; the page image goes to a private temp file (a fresh 0700 directory holding a 0600
-//! file on Unix) that is deleted afterwards; the run has a timeout and an output size cap; and
-//! every failure comes back through [`OcrError`] with its cause named.
+//! Security posture (hard rules): the program path comes from beside this executable, the PATH,
+//! or a user-configured location, never from document data; the language code is allow-listed
+//! before it reaches a process; the page image goes to a private temp file (a fresh 0700
+//! directory holding a 0600 file on Unix) that is deleted afterwards; the run has a timeout and
+//! an output size cap; and every failure comes back through [`OcrError`] with its cause named.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,9 @@ pub const LANGUAGE_CODES: &[(&str, &str)] = &[
     ("es", "spa"),
     ("it", "ita"),
     ("pt", "por"),
-    ("ru", "rus"),
+    // Russian official documents mix Cyrillic with Latin names and numbers. Both packs are
+    // allow-listed as one argument; nothing else is concatenated onto a process command.
+    ("ru", "rus+eng"),
     ("zh", "chi_sim"),
     ("ja", "jpn"),
     ("ko", "kor"),
@@ -44,21 +47,9 @@ pub const LANGUAGE_CODES: &[(&str, &str)] = &[
     ("nl", "nld"),
 ];
 
-/// English names for [`LANGUAGE_CODES`] (dropdowns show code + name).
-pub const LANGUAGE_NAMES: &[(&str, &str)] = &[
-    ("en", "English"),
-    ("de", "German"),
-    ("fr", "French"),
-    ("es", "Spanish"),
-    ("it", "Italian"),
-    ("pt", "Portuguese"),
-    ("ru", "Russian"),
-    ("zh", "Chinese (Simplified)"),
-    ("ja", "Japanese"),
-    ("ko", "Korean"),
-    ("ar", "Arabic"),
-    ("nl", "Dutch"),
-];
+/// English names for [`LANGUAGE_CODES`] (dropdowns show code + name). The same table the
+/// dialog offers, so a language the UI can pick is one this process can be asked for.
+pub const LANGUAGE_NAMES: &[(&str, &str)] = crate::DOCUMENT_LANGUAGES;
 
 /// Map a settings language code to a Tesseract one: trimmed, case-insensitive, allow-listed;
 /// anything unknown falls back to `"eng"`.
@@ -78,13 +69,43 @@ pub fn configured_path() -> Option<PathBuf> {
 }
 
 /// The program [`TesseractCli::find`] would run: a set `configured` location (the value of
-/// `PDFCRAFT_TESSERACT`) decides alone, so an invalid one yields `None` and `search` (the PATH)
-/// is not even consulted; only when nothing is configured does `search` decide.
+/// `PDFCRAFT_TESSERACT`) decides alone, so an invalid one yields `None` and `search` is not
+/// even consulted; only when nothing is configured does `search` decide.
 fn locate(configured: Option<std::ffi::OsString>, search: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
     match configured {
         Some(value) => Some(PathBuf::from(value)).filter(|program| program_is_executable(program)),
         None => search(),
     }
+}
+
+/// A `tesseract` shipped beside this executable: the portable zip's `tesseract.exe`, or one
+/// in a `tesseract/` folder next to it. Tried before the PATH so a planted PATH entry cannot
+/// hide the program that matches the shipped traineddata.
+fn bundled_program() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    bundled_in(exe.parent()?)
+}
+
+/// [`bundled_program`] for an explicit directory (tests pass one).
+fn bundled_in(dir: &Path) -> Option<PathBuf> {
+    for rel in ["", "tesseract", "Tesseract-OCR"] {
+        let base = if rel.is_empty() { dir.to_path_buf() } else { dir.join(rel) };
+        for name in program_file_names() {
+            let candidate = base.join(name);
+            if program_is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The directory Tesseract treats as the parent of `tessdata`, when that folder sits beside
+/// `program`. Derived from the program we already accepted, never from document data. Tesseract
+/// appends `tessdata` itself, so the value is the program's directory, not the data folder.
+fn tessdata_prefix(program: &Path) -> Option<std::ffi::OsString> {
+    let dir = program.parent()?;
+    dir.join("tessdata").is_dir().then(|| dir.as_os_str().to_os_string())
 }
 
 /// The first `tesseract` on the PATH that is an existing executable file. Entries that are not
@@ -284,8 +305,9 @@ impl TesseractCli {
     }
 
     /// The program this machine offers, if it answers `--list-langs`: the user-configured
-    /// location ([`configured_path`] / `$PDFCRAFT_TESSERACT`) when valid, else the first
-    /// absolute PATH entry that holds an executable `tesseract`.
+    /// location ([`configured_path`] / `$PDFCRAFT_TESSERACT`) when valid, else a `tesseract`
+    /// shipped beside this executable (the portable zip), else the first absolute PATH entry
+    /// that holds an executable `tesseract`.
     ///
     /// # The PATH-lookup risk
     ///
@@ -299,7 +321,7 @@ impl TesseractCli {
     /// A `PDFCRAFT_TESSERACT` that is set but invalid fails closed: it is never replaced by
     /// the PATH search.
     pub fn find() -> Option<TesseractCli> {
-        TesseractCli::at(locate(std::env::var_os("PDFCRAFT_TESSERACT"), path_search)?)
+        TesseractCli::at(locate(std::env::var_os("PDFCRAFT_TESSERACT"), || bundled_program().or_else(path_search))?)
     }
 
     /// Run `tesseract --list-langs` and parse it; also decides [`TesseractCli::available`].
@@ -356,24 +378,29 @@ impl TesseractCli {
             // output files above are unaffected.
             command.creation_flags(0x0800_0000);
         }
-        let mut child =
-            command
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .stdout(out_file)
-                .stderr(err_file)
-                .current_dir(&dir.path)
-                // A minimal environment: nothing from the document or the caller's shell beyond
-                // what an installed tesseract needs — its data prefix, the PATH (bare-name lookup
-                // and DLL loading), the Windows system root, and a temp dir it may write to.
-                .env_clear()
-                .envs(std::env::vars().filter(|(k, _)| {
+        command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(out_file)
+            .stderr(err_file)
+            .current_dir(&dir.path)
+            // A minimal environment: nothing from the document or the caller's shell beyond
+            // what an installed tesseract needs — its data prefix, the PATH (bare-name lookup
+            // and DLL loading), the Windows system root, and a temp dir it may write to.
+            .env_clear()
+            .envs(
+                std::env::vars().filter(|(k, _)| {
                     k.eq_ignore_ascii_case("TESSDATA_PREFIX") || k.eq_ignore_ascii_case("PATH") || k.eq_ignore_ascii_case("SystemRoot")
-                }))
-                .env("TMP", &dir.path)
-                .env("TEMP", &dir.path)
-                .spawn()
-                .map_err(|e| OcrError::NoTesseract(format!("{} could not start: {e}", self.program.display())))?;
+                }),
+            )
+            .env("TMP", &dir.path)
+            .env("TEMP", &dir.path);
+        // Traineddata shipped beside this program wins over a TESSDATA_PREFIX left in the
+        // environment, which may point at a different install that has no Russian pack.
+        if let Some(prefix) = tessdata_prefix(&self.program) {
+            command.env("TESSDATA_PREFIX", prefix);
+        }
+        let mut child = command.spawn().map_err(|e| OcrError::NoTesseract(format!("{} could not start: {e}", self.program.display())))?;
         let started = Instant::now();
         let status = loop {
             match child.try_wait() {
@@ -685,6 +712,7 @@ mod tests {
         assert_eq!(language_code("ja"), "jpn");
         assert_eq!(language_code("ko"), "kor");
         assert_eq!(language_code("nl"), "nld");
+        assert_eq!(language_code("ru"), "rus+eng", "Russian keeps Latin tokens in the same pass");
         assert_eq!(language_code("klingon"), "eng", "unknown → eng");
         assert_eq!(language_code(""), "eng");
         // The security property: whatever the settings say, only allow-listed codes reach a
@@ -988,6 +1016,40 @@ $n = [PdfCraftOcrProbe.Console]::GetConsoleProcessList($ids, 256)
         let none = path_search_in([PathBuf::from("relative/dir")].into_iter());
         assert_eq!(none, None, "only relative entries: nothing is found");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The portable zip is found before the PATH: a program next to the app, or in `tesseract/`
+    /// beside it, and its own `tessdata` folder is the prefix Tesseract is given.
+    #[test]
+    fn bundled_program_and_its_tessdata_are_found_beside_the_app() {
+        let root = std::env::temp_dir().join(format!("pdfcraft-ocr-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested = root.join("tesseract");
+        std::fs::create_dir_all(nested.join("tessdata")).unwrap();
+        let program = nested.join(program_file_names()[0]);
+        std::fs::write(&program, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755));
+        }
+        assert_eq!(bundled_in(&root).as_deref(), Some(program.as_path()));
+        assert_eq!(tessdata_prefix(&program).as_deref(), Some(nested.as_os_str()));
+        // A program sitting directly beside the app (no tessdata folder). On Unix that file
+        // is named `tesseract`, which is also the nested directory, so this case uses its
+        // own root.
+        let loose_root = root.join("loose");
+        std::fs::create_dir_all(&loose_root).unwrap();
+        let loose = loose_root.join(program_file_names()[0]);
+        std::fs::write(&loose, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755));
+        }
+        assert_eq!(bundled_in(&loose_root).as_deref(), Some(loose.as_path()));
+        assert_eq!(tessdata_prefix(&loose), None, "no tessdata beside the loose copy");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// "HELLO" as blocky 5×7 glyphs, 8 pixels per dot with wide tracking, at roughly 300 dpi
