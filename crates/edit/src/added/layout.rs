@@ -51,7 +51,19 @@ pub(super) fn wrapped(t: &AddedText) -> Vec<(String, bool, usize)> {
         // sum of its words' and shaping stays linear in the paragraph's length. The space is the
         // paragraph's; a space between Latin words is drawn in the item's font, a few hundredths
         // of an em apart.
-        let measure = |s: &str| if rtl_script || thai { shaped_width(t, s, rtl) } else { latin_width(t, s) };
+        let coverage = para.chars().any(pdfcraft_fonts::shaped_text::latin_fallback);
+        let measure = |s: &str| {
+            if rtl_script || thai {
+                shaped_width(t, s, rtl)
+            } else if coverage {
+                // The bundled face's advances for letters the standard font lacks, plus the
+                // same character spacing `Tc` adds after every character.
+                pdfcraft_fonts::shaped_text::fallback_width(s, t.size, false, true, |s, size| t.family.width(s, size, t.bold, t.italic))
+                    + t.char_spacing * s.chars().count() as f64
+            } else {
+                latin_width(t, s)
+            }
+        };
         let space = measure(" ");
         let (mut line, mut line_w) = (String::new(), 0.0);
         // Widths add up (the standard-14 widths have no kerning), so each word is measured once
@@ -208,9 +220,13 @@ pub fn first_undrawable(t: &AddedText) -> Option<char> {
         return Some(c);
     }
     if !shaped_by_a_face(t) {
-        // Drawn line by line in the item's standard font (`\n` splits lines). Without the face
-        // that is also how `draw` redraws an existing item, so it's checked that way.
-        return t.text.split('\n').find_map(pdfcraft_fonts::first_non_win_ansi);
+        // Drawn line by line in the item's standard font (`\n` splits lines), with Latin, Greek
+        // and Cyrillic that font lacks from the bundled Inter face. Without a shaped face this
+        // is also how `draw` redraws an existing item, so it's checked that way.
+        return t
+            .text
+            .split('\n')
+            .find_map(|line| line.chars().find(|c| !pdfcraft_fonts::win_ansi_encodable(*c) && !pdfcraft_fonts::shaped_text::latin_fallback(*c)));
     }
     // What `shaped_layout` leaves to the standard font, exactly as `draw_shaped` splits it.
     wrapped(t).into_iter().find_map(|(line, rtl, _)| {

@@ -7091,6 +7091,29 @@ fn cyrillic_and_greek_headers_and_watermarks_are_drawn_from_the_bundled_face() {
     assert_eq!(shared[0], shared[1], "every page draws with the same fonts");
 }
 
+/// Add text writes Cyrillic into the page from the bundled Inter face, not as `?` and not
+/// refused (#4963).
+#[test]
+fn added_cyrillic_text_is_drawn_from_the_bundled_face() {
+    let text = AddedText { rect: [72.0, 600.0, 400.0, 700.0], text: "Привет, Ada".into(), ..AddedText::default() };
+    assert_eq!(first_undrawable(&text), None);
+    let mut doc = fixture();
+    add_content(&mut doc, 0, &Content::Text(text)).unwrap();
+    let doc = reopen(&doc);
+    let drawn = streams(&doc, 0).concat();
+    assert!(drawn.contains("/PCLa") && !drawn.contains("(?"), "{drawn}");
+    let p = &pdfcraft_model::pages(&doc)[0];
+    let res = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(res.as_dict().unwrap().get(b"Font").unwrap()).as_dict().unwrap().clone();
+    let (_, font) = fonts.iter().find(|(k, _)| k.starts_with(b"PCLa")).expect("bundled face");
+    let font = doc.resolve(font).as_dict().unwrap().clone();
+    let cmap = doc.resolve(font.get(b"ToUnicode").unwrap());
+    let Object::Stream(cmap) = &*cmap else { panic!("ToUnicode") };
+    let decoded = cmap.decoded().unwrap();
+    let mapped = String::from_utf8_lossy(&decoded);
+    assert!(mapped.contains("<041F>"), "{mapped}");
+}
+
 /// #125: page-content tools refuse text the standard fonts can't draw instead of writing `?`,
 /// and leave the document untouched.
 #[test]
