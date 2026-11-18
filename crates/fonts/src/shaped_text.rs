@@ -1,9 +1,10 @@
 //! Shaped text written into a PDF: each distinct shaped cluster (a letter with its marks, and the
 //! text it stands for) becomes one glyph of a Type 3 font drawn from the craft-fonts face's
 //! outlines, with a `/ToUnicode` map so copy and search get each character once. No font file is
-//! embedded. Add text writes Arabic, Hebrew and Thai with it; text boxes, Fill & Sign text, form
-//! fields, headers, footers and watermarks write Thai with it, beside the standard font that
-//! draws the rest ([`thai_pieces`]).
+//! embedded. Add text writes Arabic, Hebrew and Thai with it. Text boxes, Fill & Sign text, form
+//! fields, headers, footers and watermarks write Thai with it, and those same appearances write
+//! the Latin, Greek and Cyrillic the standard fonts lack from the bundled Inter face, beside the
+//! standard font that draws the rest ([`fallback_pieces`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -371,8 +372,8 @@ pub fn thai_reach(line: &str) -> Option<[f64; 2]> {
 }
 
 /// The first character of `s` a generated appearance would draw as `?`: one the standard fonts
-/// (WinAnsiEncoding) can't draw and that isn't Thai, or Thai on a line the Thai face can't draw
-/// (this build has none, or it lacks a character). Line breaks don't count.
+/// (WinAnsiEncoding) can't draw, that the bundled Inter face doesn't draw either (Latin, Greek
+/// and Cyrillic it has), and that isn't Thai the Thai face can draw. Line breaks don't count.
 pub fn first_undrawable(s: &str) -> Option<char> {
     s.split(['\n', '\r']).find_map(first_undrawable_in_line)
 }
@@ -380,7 +381,14 @@ pub fn first_undrawable(s: &str) -> Option<char> {
 /// [`first_undrawable`] for one line drawn as it is: a line break in it counts.
 pub fn first_undrawable_in_line(line: &str) -> Option<char> {
     let thai_fails = line.chars().any(is_thai) && thai_pieces(line).is_err();
-    line.chars().find(|c| if is_thai(*c) { thai_fails } else { !crate::win_ansi_encodable(*c) })
+    line.chars().find(|c| {
+        if is_thai(*c) {
+            thai_fails
+        } else {
+            // Inter draws the Latin, Greek and Cyrillic WinAnsi lacks; anything else is `?`.
+            !latin_fallback(*c) && !crate::win_ansi_encodable(*c)
+        }
+    })
 }
 
 /// Why the Thai in `text` can't be drawn ([`thai_message`]): this build has no Thai face, or the
@@ -628,7 +636,8 @@ mod tests {
     fn thai_runs_are_shaped_and_the_rest_left_to_the_standard_font() {
         assert_eq!(thai_pieces("Hello").unwrap(), [Piece::Latin("Hello".into())]);
         assert!(joins_previous('\u{0E49}') && joins_previous('\u{0E33}') && !joins_previous('ก') && !joins_previous('a'));
-        assert_eq!((first_undrawable("Café\nпривет"), thai_refusal("Café"), thai_reach("Hg")), (Some('п'), None, None));
+        assert_eq!((first_undrawable("Café\nпривет"), thai_refusal("Café"), thai_reach("Hg")), (None, None, None));
+        assert_eq!(first_undrawable("Ёж и 北"), Some('北'), "Cyrillic Inter has is drawn; Han is not");
         if crate::document_thai_font().is_none() {
             assert_eq!(thai_pieces("น้ำ 1"), Err(GlyphError::NoFont));
             assert!(thai_message(GlyphError::NoFont, "").contains("this build has none"));

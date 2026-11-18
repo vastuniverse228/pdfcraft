@@ -18,7 +18,9 @@
 //! marked-content sequences before the new mark.
 //!
 //! Text uses standard Helvetica (WinAnsi) added to the page resources as `/PCHelv`; headers and
-//! footers may use standard Times (`/PCTimes`) or Courier (`/PCCour`) instead (#3754).
+//! footers may use standard Times (`/PCTimes`) or Courier (`/PCCour`) instead (#3754). Latin,
+//! Greek and Cyrillic those faces lack are drawn from the bundled Inter face, and Thai from the
+//! Thai face, as Type 3 glyphs beside that face.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 

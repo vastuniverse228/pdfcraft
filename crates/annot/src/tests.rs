@@ -3916,6 +3916,48 @@ fn thai_in_a_times_text_box_keeps_times_for_the_rest() {
     assert!(fonts.get(b"PCTh1").and_then(|f| f.as_dict()).is_some_and(|f| f.name(b"Subtype") == Some(&b"Type3"[..])), "{fonts:?}");
 }
 
+/// Cyrillic in a text box or Fill & Sign text is drawn from the bundled Inter face, not as `?`,
+/// and copies back through ToUnicode (#7113).
+#[test]
+fn cyrillic_in_a_text_box_is_drawn_from_the_bundled_face() {
+    // "Привет, Ёж"
+    let annot = "<< /Type /Annot /Subtype /FreeText /Rect [45 560 320 700] /DA (0 g /Helv 12 Tf) /BS << /W 0 >> \
+                 /Contents <FEFF041F04400438043204350442002C002004010436> >>";
+    let doc = document_of(&[
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /DR << /Font << /Helv 5 0 R /Cour 6 0 R /TiRo 7 0 R /F1 6 0 R /F2 9 0 R >> >> >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        b"<< /Type /Page /Parent 2 0 R /Annots [8 0 R] >>",
+        b"<< /Length 0 >>\nstream\n\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>",
+        annot.as_bytes(),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+HouseGothic >>",
+    ]);
+    let shown = with_missing_appearances(&doc).expect("drawn for display");
+    let d = list(&shown, 0).remove(0);
+    let n = d.get(b"AP").and_then(|a| a.as_dict()).and_then(|a| a.reference(b"N")).expect("/AP /N");
+    let (ap, fonts) = {
+        let Object::Stream(s) = &*shown.get(n) else { panic!("not a stream") };
+        let decoded = s.decoded().expect("appearance");
+        let ap = String::from_utf8_lossy(&decoded).into_owned();
+        let fonts = s.dict.get(b"Resources").and_then(|r| r.as_dict()).and_then(|r| r.get(b"Font")).expect("fonts").clone();
+        (ap, fonts)
+    };
+    assert!(ap.contains("/PCLa") && !ap.contains('?'), "{ap}");
+    let fonts = shown.resolve(&fonts).as_dict().expect("font dict").clone();
+    let (_, font) = fonts.iter().find(|(k, _)| k.starts_with(b"PCLa")).expect("bundled face");
+    let font = shown.resolve(font).as_dict().expect("font").clone();
+    assert_eq!(font.name(b"Subtype"), Some(&b"Type3"[..]));
+    let mapped = {
+        let cmap = shown.resolve(font.get(b"ToUnicode").expect("ToUnicode"));
+        let Object::Stream(cmap) = &*cmap else { panic!("ToUnicode is not a stream") };
+        let decoded = cmap.decoded().expect("cmap");
+        String::from_utf8_lossy(&decoded).into_owned()
+    };
+    assert!(mapped.contains("<041F>") && mapped.contains("<0401>") && mapped.contains("<0436>"), "{mapped}");
+}
+
 /// `/DS` (Table 177) sets the face, size and colour over `/DA`'s; a malformed one is ignored.
 #[test]
 fn free_text_ds_style_is_drawn() {
