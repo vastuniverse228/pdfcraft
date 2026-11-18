@@ -5,6 +5,8 @@
 - 2026-11-04 (M6, PR #5699 reset estimate): Charge expanded-name scans and field-name copy/comparison bytes; add three negative regressions and byte-exact refusal checks.
 # PdfCraft roadmap
 
+> **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (Windows startup tries Direct3D 12, then Vulkan, then OpenGL, and a lost GPU device no longer aborts the process; the portable zip embeds craft-fonts; estimates unchanged)
+
 > **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (recognized Russian copies back through the searchable and editable layers; the Windows portable zip ships Tesseract rus+eng and the OCR models; estimates unchanged)
 
 > **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (non-embedded Arial and Times draw Cyrillic named in /Differences from the bundled Inter face; Add text writes that Cyrillic into the page; a fork workflow builds the Windows x64 portable zip; estimates unchanged)
