@@ -5,15 +5,16 @@
 //! The plan is a pure function of the words ([`TextPlan::for_words`]). The content generators
 //! (`pdfcraft_ocr::text_layer` / `visible_text_layer`) read the per-character codes and
 //! advances from it, and whoever registers the fonts (`pdfcraft_edit::add_type3_fonts`) fills
-//! in each face's resource name and object. The build must work without craft-fonts too: there
-//! [`CRAFT_FONTS`] is empty, nothing can be planned, and every non-WinAnsi character is
-//! reported as a substitution instead.
+//! in each face's resource name and object. The build must work without craft-fonts too: the
+//! bundled Inter face still plans Latin, Greek and Cyrillic that WinAnsi cannot hold, so a
+//! recognized Russian word copies back. Characters no bundled face has (CJK, without
+//! craft-fonts) are reported as substitutions instead.
 
 use std::collections::HashMap;
 
 use pdfcraft_cos::ObjRef;
 
-use crate::{CraftFont, GlyphOutline, craft_glyph, document_japanese_font, face_has, fits_win_ansi, win_ansi_char};
+use crate::{CraftFont, GlyphOutline, craft_glyph, document_japanese_font, document_latin_fonts, face_has, fits_win_ansi, win_ansi_char};
 
 /// Unique characters per Type3 font: the same bound the text-editing fallback uses, so one
 /// hostile word cannot balloon into thousands of glyph streams. A face with more characters
@@ -70,10 +71,11 @@ pub struct TextPlan {
 impl TextPlan {
     /// Plan the output for `words`, in order: characters the WinAnsi fonts can't show get codes
     /// in Type3 fonts built from the craft-fonts faces (the document face preferred, then the
-    /// rest of the build input in manifest order); a word whose face can't show a character
-    /// substitutes its `?`. Faces are chosen per word, so a word of one script stays one face;
-    /// characters already planned for an earlier word keep their code. Built without
-    /// craft-fonts, the plan reports every non-WinAnsi character as a substitution.
+    /// rest of the build input in manifest order) and, after those, the bundled Inter face.
+    /// A word whose face can't show a character substitutes its `?`. Faces are chosen per word,
+    /// so a word of one script stays one face; characters already planned for an earlier word
+    /// keep their code. Built without craft-fonts, Inter still plans Latin, Greek and Cyrillic;
+    /// every other non-WinAnsi character is reported as a substitution.
     pub fn for_words<'a>(words: impl IntoIterator<Item = &'a str>) -> TextPlan {
         let faces = document_faces();
         let mut coverage = Coverage::default();
@@ -198,7 +200,10 @@ impl TextPlan {
 }
 
 /// The faces that can draw document text, in preference order: the Japanese document face
-/// (serif document text) first, then the rest of the build input in manifest order.
+/// (serif document text) first, then the rest of the build input in manifest order, then the
+/// bundled Inter face. Inter is last so a craft-fonts face that covers a word is preferred,
+/// and first among faces that exist in every build, so Cyrillic still gets a ToUnicode map
+/// when craft-fonts is absent (#4160).
 fn document_faces() -> Vec<&'static CraftFont> {
     let mut out = Vec::new();
     if let Some(d) = document_japanese_font() {
@@ -207,6 +212,11 @@ fn document_faces() -> Vec<&'static CraftFont> {
     for f in crate::CRAFT_FONTS {
         if !out.iter().any(|d| std::ptr::eq(*d, f)) {
             out.push(f);
+        }
+    }
+    for face in document_latin_fonts(false) {
+        if !out.iter().any(|d| std::ptr::eq(*d, face)) {
+            out.push(face);
         }
     }
     out
@@ -256,14 +266,18 @@ mod tests {
     fn face_coverage_is_remembered_per_face_and_character() {
         let faces = document_faces();
         let Some(face) = faces.first() else {
-            eprintln!("skipping: built without craft-fonts (set CRAFT_FONTS_DIR to run it)");
+            eprintln!("skipping: no document face");
             return;
         };
+        // Japanese when this build has it; otherwise the bundled Inter face and a Cyrillic word.
+        let word = if face_has(face.bytes, '日') { "日本語" } else { "Привет" };
         let mut coverage = Coverage::default();
-        let first = (0..50).map(|_| choose_face(&faces, "日本語", &mut coverage)).last().flatten();
+        let first = (0..50).map(|_| choose_face(&faces, word, &mut coverage)).last().flatten();
         assert!(first.is_some());
-        assert!(coverage.lookups <= faces.len() * 3, "{} lookups for 3 characters", coverage.lookups);
-        assert_eq!(coverage.has(0, face, '日'), face_has(face.bytes, '日'));
+        let chars = word.chars().count();
+        assert!(coverage.lookups <= faces.len() * chars, "{} lookups for {chars} characters", coverage.lookups);
+        let ch = word.chars().next().expect("the probe word is not empty");
+        assert_eq!(coverage.has(0, face, ch), face_has(face.bytes, ch));
     }
 
     /// A page's vocabulary: German umlauts are WinAnsi, and a character no bundled face has
@@ -283,15 +297,11 @@ mod tests {
     }
 
     #[test]
-    fn without_craft_fonts_every_non_win_ansi_character_is_reported() {
-        if !crate::CRAFT_FONTS.is_empty() {
-            eprintln!("built with craft-fonts: the planning tests with faces cover this instead");
-            return;
-        }
+    fn cyrillic_is_planned_from_inter_and_uncovered_scripts_are_still_counted() {
         let plan = TextPlan::for_words(["Привет", "日本", "abc"]);
-        assert!(plan.words.iter().all(Vec::is_empty));
-        assert!(plan.fonts.is_empty());
-        assert_eq!(plan.missing(), 8, "six Cyrillic + two CJK characters, each reported");
+        assert_eq!(plan.encoding(0).len(), 6, "Привет is planned, so copy keeps the letters");
+        assert_eq!(plan.missing(), if crate::CRAFT_FONTS.is_empty() { 2 } else { 0 }, "CJK needs a craft-fonts face; Cyrillic does not");
+        assert!(plan.encoding(2).is_empty(), "WinAnsi stays on the Helvetica path");
     }
 
     #[test]

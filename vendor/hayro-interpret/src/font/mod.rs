@@ -568,6 +568,13 @@ pub enum FontQuery {
     /// Note that this type of query is currently not supported,
     /// but will be implemented in the future.
     Fallback(FallbackFontQuery),
+    /// PdfCraft: a face for characters the standard stand-in does not contain
+    /// (Cyrillic and Greek named in `/Differences`, such as `afii10017`).
+    /// A resolver that has no such face returns `None`, and those characters stay blank.
+    GlyphCoverage {
+        /// Ask for the heavier cut of the coverage face.
+        bold: bool,
+    },
 }
 
 /// A query for a font with specific properties.

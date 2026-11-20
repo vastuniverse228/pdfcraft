@@ -323,7 +323,19 @@ pub(crate) fn draft_text(f: &FormField) -> String {
     {
         return shown.clone();
     }
-    value
+    // A multiline value stores a break as CR (ISO 32000-2). The editor breaks lines on LF;
+    // a bare CR is not a line, so the lines ran together and empty lines vanished (#7677).
+    if f.kind == FormFieldKind::Text && f.has(field_flags::MULTILINE) { editor_line_breaks(&value) } else { value }
+}
+
+/// Line breaks as the in-place editor shows them: CRLF and CR become LF.
+pub(crate) fn editor_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Line breaks as a multiline field stores them: LF becomes CR.
+pub(crate) fn stored_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
 impl Focus {
@@ -672,6 +684,14 @@ pub(crate) fn draft_edit(focus: &Focus, form: &[FormField]) -> Option<Edit> {
         return None;
     }
     let value = match f.kind {
+        FormFieldKind::Text if f.has(field_flags::MULTILINE) => {
+            let stored = stored_line_breaks(&focus.text);
+            let current = stored_line_breaks(f.value.first().map(String::as_str).unwrap_or(""));
+            if stored == current {
+                return None;
+            }
+            FieldValue::Text(stored)
+        }
         FormFieldKind::Text if f.value.first().map(String::as_str).unwrap_or("") != focus.text => FieldValue::Text(focus.text.clone()),
         // Typed into an editable combo box: a shown text picks its option, anything else is the
         // value itself (the engine maps it, and refuses free text when Edit is clear).
@@ -1773,5 +1793,40 @@ mod tests {
         assert_eq!(TextFrame::new(field, 0, 180, 0).turn, 180);
         // Out-of-range input stays a quarter turn.
         assert_eq!(TextFrame::new(field, i64::MIN, u16::MAX, u16::MAX).turn % 90, 0);
+    }
+
+    /// #7677: a multiline value stores breaks as CR. The editor shows them as lines, including
+    /// an empty one, and closing it without a change does not rewrite the field. A new line is
+    /// stored as CR again.
+    #[test]
+    fn a_multiline_field_keeps_carriage_return_line_breaks_in_the_editor() {
+        let value = "Строка 1\r\rСтрока 3\r\nещё";
+        let field = FormField {
+            name: "note".into(),
+            obj: ObjRef::new(1, 0),
+            kind: FormFieldKind::Text,
+            value: vec![value.into()],
+            default: Vec::new(),
+            flags: field_flags::MULTILINE,
+            max_len: None,
+            options: Vec::new(),
+            selected: Vec::new(),
+            single_value_is_array: false,
+            da: String::new(),
+            quadding: 0,
+            tooltip: None,
+            widgets: Vec::new(),
+            actions: Default::default(),
+            button: None,
+        };
+        let focus = open_focus(&field, 0);
+        assert_eq!(focus.text, "Строка 1\n\nСтрока 3\nещё");
+        assert!(draft_edit(&focus, std::slice::from_ref(&field)).is_none(), "opening does not rewrite the value");
+        let mut edited = focus;
+        edited.text.push_str("\nконец");
+        let Edit::SetFieldValue { value: FieldValue::Text(stored), .. } = draft_edit(&edited, &[field]).unwrap() else {
+            panic!("a text edit");
+        };
+        assert_eq!(stored, "Строка 1\r\rСтрока 3\rещё\rконец");
     }
 }

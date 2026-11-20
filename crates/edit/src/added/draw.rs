@@ -143,6 +143,12 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
                 out.extend_from_slice(b"Q\n");
                 return Ok((out, res));
             }
+            if t.text.chars().any(pdfcraft_fonts::shaped_text::latin_fallback) {
+                draw_coverage(doc, t, taken, &mut fonts, &mut out)?;
+                res.set(b"Font".to_vec(), Object::Dict(fonts));
+                out.extend_from_slice(b"Q\n");
+                return Ok((out, res));
+            }
             res.set(b"Font".to_vec(), Object::Dict(fonts));
             let r = text_rect(t);
             out.extend(format!("BT /{name} {} Tf {}\n", n(t.size), t.fill_op()).bytes());
@@ -194,6 +200,38 @@ pub(super) fn draw(doc: &mut Document, c: &Content, view: [f64; 6], taken: &Dict
     }
     out.extend_from_slice(b"Q\n");
     Ok((out, res))
+}
+
+/// Latin, Greek and Cyrillic the item's standard font lacks, drawn from the bundled Inter
+/// face as Type 3 glyphs. The rest of the line stays in the standard font.
+fn draw_coverage(doc: &mut Document, t: &AddedText, taken: &Dict, fonts: &mut Dict, out: &mut Vec<u8>) -> Result<(), EditError> {
+    use pdfcraft_fonts::shaped_text::{self, Piece};
+    let wrapped_lines = wrapped(t);
+    let lines: Vec<String> = wrapped_lines.iter().map(|(line, ..)| line.clone()).collect();
+    let pieces: Vec<Vec<Piece>> =
+        lines.iter().map(|line| shaped_text::fallback_pieces(line, false, true).unwrap_or_else(|_| vec![Piece::Latin(line.clone())])).collect();
+    let shaped =
+        ShapedFonts::new(shaped_text::clusters(pieces.iter().map(Vec::as_slice)), pdfcraft_fonts::shaped_glyph, taken, fonts, "PCLa", &mut |o| {
+            Object::Ref(doc.add(o))
+        })
+        .map_err(|(e, c)| EditError::Invalid(shaped_text::latin_message(e, &c.text)))?;
+    let r = text_rect(t);
+    let latin = font_name(t.family.base_font(t.bold, t.italic));
+    out.extend(format!("BT {}\n", t.fill_op()).bytes());
+    if t.char_spacing != 0.0 {
+        out.extend(format!("{} Tc\n", n(t.char_spacing)).bytes());
+    }
+    let face = |s: &str, size: f64| t.family.width(s, size, t.bold, t.italic);
+    let paragraphs: Vec<usize> = wrapped_lines.iter().map(|(_, _, p)| *p).collect();
+    let mut current = None;
+    for (i, (line, pieces)) in lines.iter().zip(&pieces).enumerate() {
+        let w = shaped_text::fallback_width(line, t.size, false, true, face) + t.char_spacing * line.chars().count() as f64;
+        let y = r[3] - (i as f64 * 1.2 + 0.95) * t.size;
+        let (x, _) = placed(t, r, &paragraphs, i, w, line.matches(' ').count(), false);
+        shaped.show_line(out, pieces, x, y, t.size, &latin, win_ansi, |s| face(s, t.size), &mut current);
+    }
+    out.extend_from_slice(b"ET\n");
+    Ok(())
 }
 
 pub(super) fn params(c: &Content) -> Dict {

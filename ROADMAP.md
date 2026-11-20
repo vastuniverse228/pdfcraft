@@ -5,6 +5,14 @@
 - 2026-11-04 (M6, PR #5699 reset estimate): Charge expanded-name scans and field-name copy/comparison bytes; add three negative regressions and byte-exact refusal checks.
 # PdfCraft roadmap
 
+> **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (Windows startup tries Direct3D 12, then Vulkan, then OpenGL, and a lost GPU device no longer aborts the process; the portable zip embeds craft-fonts; estimates unchanged)
+
+> **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (recognized Russian copies back through the searchable and editable layers; the Windows portable zip ships Tesseract rus+eng and the OCR models; estimates unchanged)
+
+> **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (non-embedded Arial and Times draw Cyrillic named in /Differences from the bundled Inter face; Add text writes that Cyrillic into the page; a fork workflow builds the Windows x64 portable zip; estimates unchanged)
+
+> **Last reviewed:** 2026-11-18 | **Last updated:** 2026-11-18 | **Change:** patch (Cyrillic and Greek in text boxes, Fill & Sign, headers, footers and watermarks are drawn from the bundled Inter face; multiline form fields keep carriage-return line breaks in the editor; Recognize text no longer skips a one-point-per-pixel scan when straightening is on; estimates unchanged)
+
 > **Last reviewed:** 2026-11-16 | **Last updated:** 2026-11-16 | **Change:** patch (M5 #3741: Ctrl+M opens Comments on Windows/Linux without toggling it closed; macOS leaves Command+M for Minimize; platform-specific shortcut surfaces and regressions retained; estimates unchanged)
 
 > **Last reviewed:** 2026-11-15 | **Last updated:** 2026-11-15 | **Change:** minor (craft-libs cutover for codecs, XFA XML, crypt/filters/COS/export/XFDF, PRC and ZIP; print colour management for pictures; M7 line replacement keeps source fonts; auto-tag headings by size and weight; arrow-key comment moves; stream-filter JPEG export; form, signature, optimize, redaction, measurement, PRC-normal and CMYK fixes; v0.21.1 Flatpak fix; estimates unchanged)

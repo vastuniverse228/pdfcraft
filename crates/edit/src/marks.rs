@@ -1,10 +1,12 @@
-use pdfcraft_fonts::shaped_text::{Piece, ShapedFonts, clusters, first_undrawable_in_line, is_thai, thai_message, thai_pieces};
+use pdfcraft_fonts::shaped_text::{
+    Piece, ShapedFonts, clusters, fallback_pieces, first_undrawable_in_line, is_thai, latin_fallback, latin_message, thai_message, thai_pieces,
+};
 
 use super::{Dict, Document, EditError, Object, Rgb, added};
 
-/// The Thai of a header, footer or text watermark, drawn from the Thai face as Add text draws it:
-/// Type 3 fonts added to the document once and to each page the mark goes on, beside the page
-/// font that draws the rest.
+/// Thai, and the Latin, Greek and Cyrillic the standard fonts lack, in a header, footer or text
+/// watermark. Drawn as Add text draws it: Type 3 fonts added to the document once and to each
+/// page the mark goes on, beside the page font that draws the rest.
 #[derive(Default)]
 pub(crate) struct MarkText {
     shaped: ShapedFonts,
@@ -13,17 +15,23 @@ pub(crate) struct MarkText {
 }
 
 impl MarkText {
-    /// The fonts for the Thai in `lines` (every line the mark draws, on any page), named so that
-    /// none of `pages` (of `all`) has the name already. Thai this build can't draw (it has no Thai
-    /// face, or the face lacks a character) is refused, saying what to do.
+    /// The fonts for the Thai and the bundled-face letters in `lines` (every line the mark draws,
+    /// on any page), named so that none of `pages` (of `all`) has the name already. Text this
+    /// build can't draw (no Thai face, or a face lacks a character) is refused, saying what to do.
     pub(crate) fn new<'a>(
         doc: &mut Document,
         all: &[pdfcraft_model::Page],
         pages: &[usize],
         lines: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, EditError> {
-        let thai = |line: &str| thai_pieces(line).map_err(|e| EditError::Invalid(thai_message(e, line)));
-        let pieces = lines.into_iter().filter(|l| l.chars().any(is_thai)).map(thai).collect::<Result<Vec<_>, _>>()?;
+        let shape = |line: &str| {
+            fallback_pieces(line, true, true).map_err(|e| {
+                let msg = if line.chars().any(is_thai) && thai_pieces(line).is_err() { thai_message(e, line) } else { latin_message(e, line) };
+                EditError::Invalid(msg)
+            })
+        };
+        let needs = |line: &&str| line.chars().any(|c| is_thai(c) || latin_fallback(c));
+        let pieces = lines.into_iter().filter(needs).map(shape).collect::<Result<Vec<_>, _>>()?;
         if pieces.is_empty() {
             return Ok(Self::default());
         }
@@ -34,16 +42,27 @@ impl MarkText {
             }
         }
         let mut fonts = Dict::new();
+        // PCTh when any glyph is Thai, so a Thai mark keeps the names it already wrote; Cyrillic
+        // and Greek alone are PCLa, as a form field's bundled-face run is.
+        let has_thai = pieces.iter().flatten().any(|p| match p {
+            Piece::Shaped(clusters) => clusters.iter().any(|g| g.text.chars().any(is_thai)),
+            Piece::Latin(_) => false,
+        });
+        let prefix = if has_thai { "PCTh" } else { "PCLa" };
         let shaped =
-            ShapedFonts::new(clusters(pieces.iter().map(Vec::as_slice)), pdfcraft_fonts::shaped_glyph, &taken, &mut fonts, "PCTh", &mut |o| {
+            ShapedFonts::new(clusters(pieces.iter().map(Vec::as_slice)), pdfcraft_fonts::shaped_glyph, &taken, &mut fonts, prefix, &mut |o| {
                 Object::Ref(doc.add(o))
             })
-            .map_err(|(e, c)| EditError::Invalid(thai_message(e, &c.text)))?;
+            .map_err(|(e, c)| {
+                let msg = if c.text.chars().any(is_thai) { thai_message(e, &c.text) } else { latin_message(e, &c.text) };
+                EditError::Invalid(msg)
+            })?;
         Ok(Self { shaped, fonts })
     }
 
-    /// Show `line` inside `BT … ET` from `x` on baseline `y` at `size`: its Thai from the fonts,
-    /// the rest in the page font `latin` (selected when `current` is `None`), `width` wide.
+    /// Show `line` inside `BT … ET` from `x` on baseline `y` at `size`: its Thai and the letters
+    /// the standard fonts lack from the fonts, the rest in the page font `latin` (selected when
+    /// `current` is `None`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn show(
         &self,
@@ -57,8 +76,9 @@ impl MarkText {
         current: &mut Option<usize>,
     ) {
         let plain = || vec![Piece::Latin(line.into())];
-        // `new` shaped every line drawn, so this shapes.
-        let pieces = if self.fonts.is_empty() || !line.chars().any(is_thai) { plain() } else { thai_pieces(line).unwrap_or_else(|_| plain()) };
+        // `new` shaped every line drawn, so this shapes the same way.
+        let needs = line.chars().any(|c| is_thai(c) || latin_fallback(c));
+        let pieces = if self.fonts.is_empty() || !needs { plain() } else { fallback_pieces(line, true, true).unwrap_or_else(|_| plain()) };
         self.shaped.show_line(out, &pieces, x, y, size, latin, pdfcraft_fonts::win_ansi, width, current);
     }
 
@@ -136,10 +156,12 @@ impl Default for HeaderFooter {
 
 impl HeaderFooter {
     /// The first character [`add_header_footer`] would refuse, because neither the standard
-    /// fonts nor (for Thai) the Thai face can draw it (#125). Tokens only add ASCII (Bates
-    /// prefixes and suffixes are part of the template), so checking the templates, split as
-    /// `expand`'s output is, covers every page (and a `\r` that would be drawn is refused too).
-    /// The dialog asks this too, so its preview never offers text that applying refuses (#2013).
+    /// fonts, nor the bundled Inter face (Latin, Greek and Cyrillic they lack), nor (for Thai)
+    /// the Thai face can draw it (#125). Tokens only add ASCII (Bates prefixes and suffixes are
+    /// part of the template), so checking the templates, split as `expand`'s output is, covers
+    /// every page (and a `\r` that would be drawn is refused too). The dialog asks this too, so
+    /// its preview never offers text that applying refuses (#2013). Cyrillic and Greek the
+    /// bundled face has are drawn, not refused.
     pub fn first_undrawable(&self) -> Option<char> {
         self.text.iter().flat_map(|t| t.lines()).find_map(first_undrawable_in_line)
     }
@@ -214,8 +236,8 @@ pub struct Watermark {
 
 impl Watermark {
     /// The first character of a text watermark [`add_watermark`] would refuse, because neither
-    /// the standard fonts nor (for Thai) the Thai face can draw it (#125). A picture watermark
-    /// draws no text.
+    /// the standard fonts, nor the bundled Inter face, nor (for Thai) the Thai face can draw it
+    /// (#125). A picture watermark draws no text.
     pub fn first_undrawable(&self) -> Option<char> {
         match self.source {
             Some(_) => None,

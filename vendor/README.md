@@ -116,6 +116,8 @@ Covered by `filter::jpx::tests::jpx_palette_is_applied_without_a_color_space`,
 `filter::jpx::tests::palette_colours_are_eight_bit_and_other_samples_keep_their_precision` and
 `raster::tests::a_jp2_palette_keeps_its_colours_whatever_the_index_precision`.
 
+Non-embedded simple fonts whose `/Differences` name Cyrillic or Greek (`afii10017` for А): hayro-interpret asks the font resolver for `FontQuery::GlyphCoverage` and draws those letters from that face when the standard stand-in has no glyph. PdfCraft answers with the bundled Inter face (#2908). A resolver that returns nothing leaves the letters blank, as before.
+
 Glyph names outside the Adobe Glyph List (#3169, #3170): hayro-interpret's `glyph_name_to_text`
 maps a name by the glyph list specification's full mapping (drop from the first `.`, split on `_`,
 each part through the list, `uniXXXX…` or `uXXXX`; a `uni` part with any group that isn't a

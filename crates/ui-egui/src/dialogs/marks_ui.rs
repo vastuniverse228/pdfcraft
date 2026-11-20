@@ -923,11 +923,15 @@ mod tests {
     fn text_applying_would_refuse_is_caught_in_the_dialog() {
         let mut d = MarksDraft::default();
         d.hf.text[5] = "Страница <<1>> из <<n>> / Page <<1>> of <<n>>".into();
-        assert_eq!(undrawable(MarkKind::HeaderFooter, &d), Some('С'), "#2013: refused before OK, not after");
+        assert_eq!(undrawable(MarkKind::HeaderFooter, &d), None, "Cyrillic is drawn from the bundled face");
+        d.hf.text[5] = "第 <<1>> 页".into();
+        assert_eq!(undrawable(MarkKind::HeaderFooter, &d), Some('第'), "Han is still refused before OK");
         d.hf.text[5] = "Page <<1>> of <<n>> — café".into();
         assert_eq!(undrawable(MarkKind::HeaderFooter, &d), None);
         d.wm.text = "ΑΠΟΡΡΗΤΟ".into();
-        assert_eq!(undrawable(MarkKind::Watermark, &d), Some('Α'));
+        assert_eq!(undrawable(MarkKind::Watermark, &d), None, "Greek is drawn from the bundled face");
+        d.wm.text = "机密".into();
+        assert_eq!(undrawable(MarkKind::Watermark, &d), Some('机'));
         d.use_file = true;
         assert_eq!(undrawable(MarkKind::Watermark, &d), None, "a picture watermark draws no text");
         assert_eq!(undrawable(MarkKind::Background, &d), None);

@@ -6971,7 +6971,8 @@ fn hebrew_letters_the_page_font_lacks_use_the_hebrew_face() {
 }
 
 /// #2013: the dialog asks `first_undrawable` before offering OK, so it must refuse exactly what
-/// applying refuses: a Cyrillic footer was previewed (in the interface font) and then failed.
+/// applying refuses. Cyrillic and Greek the bundled face has are drawn (#2013); a character
+/// no face here has, and a lone CR, are still refused.
 #[test]
 fn header_and_watermark_drawability_matches_what_applying_refuses() {
     let footer = |t: &str| HeaderFooter {
@@ -6979,12 +6980,13 @@ fn header_and_watermark_drawability_matches_what_applying_refuses() {
         ..HeaderFooter::default()
     };
     for (text, refused) in [
-        ("Страница <<1>> из 1 / Page <<1>> of 1", Some('С')),
+        ("Страница <<1>> из 1 / Page <<1>> of 1", None),
         ("TEST-001 <<Page 1 of n>>", None),
         ("Café — 5€ ™ <<Bates Number#6#1#ACME-#>>", None),
         ("Left\r\nRight", None),
         ("A\rB", Some('\r')),
-        ("line one\nΕλληνικά", Some('Ε')),
+        ("line one\nΕλληνικά", None),
+        ("第 <<1>> 页", Some('第')),
     ] {
         let hf = footer(text);
         assert_eq!(hf.first_undrawable(), refused, "{text:?}");
@@ -7050,6 +7052,68 @@ fn thai_headers_footers_and_watermarks_are_drawn_from_the_thai_face() {
     assert_eq!(shared[0], shared[1], "every page draws with the same fonts");
 }
 
+/// Cyrillic and Greek the standard fonts lack are drawn from the bundled Inter face, the way
+/// Thai is drawn from the Thai face: Type 3 glyphs, a ToUnicode map, no `?`, shared by every
+/// page. A Russian footer and a Greek watermark both copy back as typed (#2013, #7113).
+#[test]
+fn cyrillic_and_greek_headers_and_watermarks_are_drawn_from_the_bundled_face() {
+    let footer = HeaderFooter {
+        text: [String::new(), String::new(), String::new(), String::new(), String::new(), "Привет, Ёж <<1>>".into()],
+        ..HeaderFooter::default()
+    };
+    let wm = Watermark { text: "Ελληνικά".into(), ..Watermark::default() };
+    assert_eq!((footer.first_undrawable(), wm.first_undrawable()), (None, None));
+    let mut doc = fixture();
+    add_header_footer(&mut doc, &[0, 1], &footer, false, &cx()).unwrap();
+    add_watermark(&mut doc, &[0, 1], &wm, false).unwrap();
+    let doc = reopen(&doc);
+    let mut shared = Vec::new();
+    for page in 0..2 {
+        let drawn = streams(&doc, page).concat();
+        assert!(drawn.contains("/PCLa") && !drawn.contains("(?"), "{drawn}");
+        let p = &pdfcraft_model::pages(&doc)[page];
+        let res = doc.resolve(p.dict.get(b"Resources").unwrap());
+        let fonts = doc.resolve(res.as_dict().unwrap().get(b"Font").unwrap()).as_dict().unwrap().clone();
+        let shaped: Vec<_> = fonts.iter().filter(|(k, _)| k.starts_with(b"PCLa")).map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert!(!shaped.is_empty(), "a bundled-face font on the page");
+        let mut mapped = String::new();
+        for (_, f) in &shaped {
+            let f = doc.resolve(f).as_dict().unwrap().clone();
+            assert_eq!(f.name(b"Subtype"), Some(&b"Type3"[..]));
+            mapped += &String::from_utf8_lossy(&stream_bytes(&doc, f.get(b"ToUnicode").unwrap()).unwrap());
+        }
+        // П, Ё and Ε copy as typed.
+        for text in ["<041F>", "<0401>", "<0395>"] {
+            assert!(mapped.contains(text), "{text} in {mapped}");
+        }
+        shared.push(shaped);
+    }
+    assert_eq!(shared[0], shared[1], "every page draws with the same fonts");
+}
+
+/// Add text writes Cyrillic into the page from the bundled Inter face, not as `?` and not
+/// refused (#4963).
+#[test]
+fn added_cyrillic_text_is_drawn_from_the_bundled_face() {
+    let text = AddedText { rect: [72.0, 600.0, 400.0, 700.0], text: "Привет, Ada".into(), ..AddedText::default() };
+    assert_eq!(first_undrawable(&text), None);
+    let mut doc = fixture();
+    add_content(&mut doc, 0, &Content::Text(text)).unwrap();
+    let doc = reopen(&doc);
+    let drawn = streams(&doc, 0).concat();
+    assert!(drawn.contains("/PCLa") && !drawn.contains("(?"), "{drawn}");
+    let p = &pdfcraft_model::pages(&doc)[0];
+    let res = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(res.as_dict().unwrap().get(b"Font").unwrap()).as_dict().unwrap().clone();
+    let (_, font) = fonts.iter().find(|(k, _)| k.starts_with(b"PCLa")).expect("bundled face");
+    let font = doc.resolve(font).as_dict().unwrap().clone();
+    let cmap = doc.resolve(font.get(b"ToUnicode").unwrap());
+    let Object::Stream(cmap) = &*cmap else { panic!("ToUnicode") };
+    let decoded = cmap.decoded().unwrap();
+    let mapped = String::from_utf8_lossy(&decoded);
+    assert!(mapped.contains("<041F>"), "{mapped}");
+}
+
 /// #125: page-content tools refuse text the standard fonts can't draw instead of writing `?`,
 /// and leave the document untouched.
 #[test]
@@ -7060,10 +7124,10 @@ fn page_text_the_standard_fonts_cant_draw_is_refused() {
     let err = add_content(&mut doc, 0, &Content::Text(text)).unwrap_err().to_string();
     assert!(err.contains("\"日\" (U+65E5)"), "{err}");
     let hf = HeaderFooter {
-        text: ["Ελληνικά".into(), String::new(), String::new(), String::new(), String::new(), String::new()],
+        text: ["日本語".into(), String::new(), String::new(), String::new(), String::new(), String::new()],
         ..HeaderFooter::default()
     };
-    assert!(add_header_footer(&mut doc, &[0, 1], &hf, true, &cx()).unwrap_err().to_string().contains("U+0395"));
+    assert!(add_header_footer(&mut doc, &[0, 1], &hf, true, &cx()).unwrap_err().to_string().contains("U+65E5"));
     let wm = Watermark { text: "机密".into(), ..Watermark::default() };
     assert!(add_watermark(&mut doc, &[0], &wm, true).unwrap_err().to_string().contains("U+673A"));
     let after: Vec<Vec<String>> = (0..3).map(|p| streams(&reopen(&doc), p)).collect();

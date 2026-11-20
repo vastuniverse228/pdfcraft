@@ -15,8 +15,8 @@ use pdfcraft_render::text::TextFilter;
 use pdfcraft_render::{PageInfo, PageRenderer, RenderConfig, RenderRequest, RequestKind};
 
 pub use pdfcraft_ocr::{
-    ConfidenceBand, DETECTION_MODEL, LANGUAGES, Line, MergeStrategy, Models, Ocr, OcrError, OcrImage, PlacedWord, RECOGNITION_MODEL, Recognizer,
-    StrategyOutcome, Word, band_for, is_suspect, lines_from_json, low_confidence,
+    ConfidenceBand, DETECTION_MODEL, DOCUMENT_LANGUAGES, LANGUAGES, Line, MergeStrategy, Models, Ocr, OcrError, OcrImage, PlacedWord,
+    RECOGNITION_MODEL, Recognizer, StrategyOutcome, Word, band_for, builtin_reads, is_suspect, lines_from_json, low_confidence,
 };
 
 use crate::{DocId, Edit, EditError, Session};
@@ -162,6 +162,17 @@ const ALREADY_ON_PAGE: f32 = 0.5;
 /// The long side of an A4 sheet in points (a letter page's, 792, is shorter): "Downsample to"
 /// is a resolution on paper this size or smaller.
 const SHEET: f32 = 842.0;
+
+/// Dots per inch of a raster rendered at `scale` pixels per point of `page`.
+///
+/// A page larger than a sheet is measured as if shrunk onto one, the same fit
+/// [`OcrJob::render_scale`] uses. Otherwise a 300 dpi scan stored at one point per pixel
+/// looks like 72 dpi, and preprocessing (which brings anything under 300 dpi up to 300)
+/// enlarges it past the pixel cap and the page is skipped (#7678).
+fn preprocess_dpi(scale: f32, page: &PageInfo) -> f32 {
+    let fit = (SHEET / page.width.max(page.height).max(1e-3)).min(1.0);
+    if fit > 1e-3 { scale * 72.0 / fit } else { scale * 72.0 }
+}
 
 /// The text of `page`'s own: its glyphs, without the words drawn as outlines or pictures that only
 /// `/ActualText` names.
@@ -537,12 +548,19 @@ fn configured_tesseract(settings: &OcrSettings) -> Option<String> {
 /// cannot start fails with its cause named.
 pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
     // The Tesseract probe (a `--list-langs` process) runs before any static mutex is taken, so
-    // recognition on other threads is never blocked behind someone's discovery. A job that
-    // names its engines never starts it: only Tesseract and Automatic read anything from it,
-    // so an ocrs-only job pays no process and no wait.
+    // recognition on other threads is never blocked behind someone's discovery. An English
+    // ocrs-only job never starts it. A non-English job does, because the built-in models
+    // cannot read that language.
     let configured = configured_tesseract(settings);
-    let tesseract =
-        if matches!(settings.engine, EngineChoice::Tesseract | EngineChoice::Auto) { tesseract_engine(configured.as_deref()) } else { None };
+    // The built-in models read English only. A Russian (or other non-English) job stays on
+    // them only when Tesseract is absent, and then the error names why: Latin look-alikes
+    // would copy as the wrong letters (#4160).
+    let needs_tesseract = !builtin_reads(&settings.language);
+    let tesseract = if needs_tesseract || matches!(settings.engine, EngineChoice::Tesseract | EngineChoice::Auto) {
+        tesseract_engine(configured.as_deref())
+    } else {
+        None
+    };
     let mut slot = ENGINES.lock().unwrap_or_else(|e| e.into_inner());
     let cache = slot.get_or_insert_with(|| EngineCache { ocrs: None });
     if cache.ocrs.is_none() {
@@ -550,6 +568,16 @@ pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
         cache.ocrs = pdfcraft_ocr::OcrsRecognizer::find().ok().map(|r| Arc::new(r) as Arc<dyn Recognizer>);
     }
     let ocrs = cache.ocrs.clone();
+    if needs_tesseract {
+        let primary = tesseract.ok_or_else(|| {
+            format!(
+                "{}; the built-in models read English only, so {} needs tesseract and its traineddata",
+                tesseract_unavailable(),
+                settings.language
+            )
+        })?;
+        return Ok(Recognizers { primary, secondary: None });
+    }
     match settings.engine {
         EngineChoice::Ocrs => Ok(Recognizers { primary: ocrs.ok_or_else(models_missing)?, secondary: None }),
         EngineChoice::Tesseract => Ok(Recognizers { primary: tesseract.ok_or_else(tesseract_unavailable)?, secondary: None }),
@@ -564,7 +592,7 @@ pub fn recognizers(settings: &OcrSettings) -> Result<Recognizers, String> {
 /// Why Tesseract cannot run, named for the user.
 #[cfg(not(target_arch = "wasm32"))]
 fn tesseract_unavailable() -> String {
-    "the tesseract program was not found (install it, or add it to the PATH)".into()
+    "the tesseract program was not found (install it, add it to the PATH, or place it beside the app with a tessdata folder)".into()
 }
 
 /// Why Tesseract cannot run, named for the user (the web build has no processes).
@@ -818,11 +846,12 @@ impl OcrSteps {
         };
         // Preprocessing sits between the page raster and recognition; its word boxes come
         // back in processed coordinates and are mapped to the ORIGINAL raster's before
-        // placement. The render dpi is the real one (pixels per point × 72), never a
-        // fixed value.
+        // placement. The dpi is the raster's against a sheet, not the page box: a scan whose
+        // box is one point per pixel (#1848) is already its own pixels, and calling that 72 dpi
+        // enlarges it past the pixel cap as soon as a preprocessing step is on (#7678).
         let pre = pdfcraft_ocr::preprocess::preprocess(
             image,
-            scale * 72.0,
+            preprocess_dpi(scale, &info),
             &pdfcraft_ocr::preprocess::PreprocessOptions {
                 auto_rotate: settings.auto_rotate,
                 deskew: settings.deskew,
@@ -1722,6 +1751,16 @@ mod tests {
         let wants = OcrSettings { engine: EngineChoice::Tesseract, tesseract_path: Some(program), ..Default::default() };
         let _ = recognizers(&wants);
         assert!(marker.exists(), "a tesseract job probes its program");
+
+        // Russian is not in the built-in alphabet, so an ocrs choice still looks for tesseract
+        // and refuses to write Latin look-alikes when that program cannot run.
+        let (marker, program) = probe("russian");
+        let russian = OcrSettings { engine: EngineChoice::Ocrs, language: "ru".into(), tesseract_path: Some(program), ..Default::default() };
+        let Err(err) = recognizers(&russian) else {
+            panic!("a dead tesseract is not a Russian reader");
+        };
+        assert!(marker.exists(), "a Russian job probes tesseract even when the choice says ocrs");
+        assert!(err.contains("tesseract") && err.contains("ru"), "{err}");
     }
 
     /// A fake engine for the batch skip logic: reads one confident word from anything, counts
@@ -2134,11 +2173,27 @@ mod tests {
         let mut out = Session::new();
         let oid = out.open("ocr.pdf", None, bytes, None).unwrap();
         let text = crate::tests::page_texts(&out, oid)[0].clone();
-        if pdfcraft_fonts::CRAFT_FONTS.is_empty() {
-            assert!(text.contains("??????"), "{text}");
-        } else {
-            assert!(text.contains("Привет"), "{text}");
-        }
+        assert!(text.contains("Привет"), "the editable layer copies the Cyrillic letters: {text}");
+    }
+
+    /// The searchable layer's ToUnicode map keeps a recognized Russian word, with or without
+    /// craft-fonts (#4160).
+    #[test]
+    fn searchable_layer_round_trips_russian() {
+        let mut s = Session::new().with_clock(|| 1_700_000_000);
+        let id = s.open("src.pdf", None, Arc::new(fixture(1)), None).unwrap();
+        let word = PlacedWord {
+            text: "Привет".into(),
+            origin: [20.0, 250.0],
+            across: [80.0, 0.0],
+            up: [0.0, 10.0],
+            confidence: None,
+            source: "tesseract".into(),
+        };
+        s.apply(id, Edit::AddOcrText { page: 0, words: vec![word] }).unwrap();
+        let text = crate::tests::page_texts(&s, id)[0].clone();
+        assert!(text.contains("Привет"), "{text}");
+        assert!(!text.contains('?'), "{text}");
     }
 
     /// The editable output's VISIBLE layer — a Type3 run for the Cyrillic word, Helvetica for
@@ -2147,10 +2202,6 @@ mod tests {
     /// the Latin word elsewhere on the page stays.
     #[test]
     fn the_editable_type3_layer_is_redacted_end_to_end() {
-        if pdfcraft_fonts::CRAFT_FONTS.is_empty() {
-            eprintln!("skipping: built without craft-fonts (set CRAFT_FONTS_DIR to run it)");
-            return;
-        }
         let mut s = Session::new().with_clock(|| 1_700_000_000);
         let id = s.open("src.pdf", None, Arc::new(fixture(1)), None).unwrap();
         let word = |text: &str, y: f64, w: f64| PlacedWord {
@@ -2347,6 +2398,24 @@ mod tests {
                 assert!(near(shot.width, want[0]) && near(shot.height, want[1]), "{dpi} dpi, page {page}: {}x{}", shot.width, shot.height);
             }
         }
+    }
+
+    /// #7678: straightening a scan whose page box is one point per pixel must not enlarge that
+    /// raster to 300 dpi of the inflated box (past the 10 000-pixel side) and skip the page.
+    /// The pixels are already the scan; preprocessing reads them at the sheet's dpi.
+    #[test]
+    fn preprocessing_a_pixel_sized_scan_keeps_the_page() {
+        let mut s = Session::new();
+        let page = export::encode_png(2480, 3508, &vec![255; (2480 * 3508 * 4) as usize]).unwrap();
+        let bytes = s.create_from_images(&[("a4.png".into(), page)]).unwrap();
+        let id = s.open("scan.pdf", None, bytes, None).unwrap();
+        let job = s.ocr_job(id, &[0], OcrSettings { dpi: 300.0, deskew: true, ..Default::default() }).unwrap();
+        let mut steps = job.steps();
+        let prepared = steps.next_page().unwrap();
+        let mut shot = prepared.unwrap_or_else(|skipped| panic!("page skipped: {}", skipped.skipped.unwrap_or_default()));
+        let image = shot.take_image().expect("a raster");
+        assert!(image.width() <= 10_000 && image.height() <= 10_000, "{}x{}", image.width(), image.height());
+        assert!(image.width() < 4000 && image.height() < 5000, "not enlarged past the scan: {}x{}", image.width(), image.height());
     }
 
     /// The first and last letters of a line are read: ocrs' own 3-pixel margin clipped them at

@@ -14,9 +14,12 @@
 //! searchable layer uses empty Type3 programs and ToUnicode maps, preserving Unicode without
 //! display fonts. WinAnsi-only invisible text keeps the standard Helvetica layout here.
 //!
-//! The ocrs models read the Latin alphabet (English and other languages written without
-//! accents); Tesseract (the `tesseract` module, off the web build) reads whatever its installed
-//! language packs cover.
+//! The ocrs models read the Latin alphabet (English written without accents). Tesseract (the
+//! `tesseract` module, off the web build) reads the other [`DOCUMENT_LANGUAGES`], including
+//! Russian, from traineddata beside the program or on the PATH. The Windows portable zip ships
+//! `tesseract.exe` with `rus` and `eng`. Copying a recognized Russian word keeps the letters:
+//! the searchable layer writes ToUnicode, and the editable layer plans those letters in the
+//! bundled Inter face.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
@@ -46,6 +49,31 @@ pub const MAX_SIDE: u32 = 10_000;
 /// multiply out to a raster no engine should have to read; larger images are rejected with
 /// [`OcrError::ImageTooLarge`] instead of being processed.
 pub const MAX_PIXELS: u32 = 64_000_000;
+
+/// Languages Recognize Text offers. English is read by the built-in models. Every other code
+/// needs Tesseract and its traineddata; the Windows portable zip ships `rus` and `eng`.
+pub const DOCUMENT_LANGUAGES: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("de", "German"),
+    ("fr", "French"),
+    ("es", "Spanish"),
+    ("it", "Italian"),
+    ("pt", "Portuguese"),
+    ("ru", "Russian"),
+    ("zh", "Chinese (Simplified)"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("ar", "Arabic"),
+    ("nl", "Dutch"),
+];
+
+/// Whether the built-in models can read `language`. They cover English in the Latin alphabet
+/// without accents. Russian and the other [`DOCUMENT_LANGUAGES`] need Tesseract: leaving them
+/// on the built-in engine writes Latin look-alikes that copy as the wrong letters (#4160).
+pub fn builtin_reads(language: &str) -> bool {
+    let code = language.trim().to_ascii_lowercase();
+    LANGUAGES.iter().any(|(k, _)| *k == code)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OcrError {
@@ -417,7 +445,7 @@ pub fn text_layer(words: &[PlacedWord], plan: &pdfcraft_fonts::TextPlan) -> Vec<
         // be drawn, and a NaN or infinite one would put non-finite numbers on the page. (NaN
         // fails every comparison, so the positivity checks already refuse it; the finiteness
         // checks keep that property explicit.)
-        if width <= 0.0 || !(height > 0.0 && height.is_finite()) || !(across > 0.0 && across.is_finite()) || !w.origin.iter().all(|v| v.is_finite()) {
+        if !(width > 0.0 && height > 0.0 && height.is_finite() && across > 0.0 && across.is_finite() && w.origin.iter().all(|v| v.is_finite())) {
             continue;
         }
         // The em square. Helvetica words: the word's own ink (cap height or x-height,
@@ -760,8 +788,30 @@ mod tests {
         assert!(v.contains(&format!("{} Tz", num(60.0 / (total * size) * 100.0))), "{v}");
     }
 
-    /// Without planned characters (an empty plan: built without craft-fonts, or before the
-    /// fonts are registered) the WinAnsi path stands, '?' included.
+    /// A recognized Russian word is planned in the bundled face, so the text layer keeps the
+    /// letters instead of WinAnsi question marks (#4160).
+    #[test]
+    fn russian_words_are_planned_instead_of_question_marks() {
+        let w = PlacedWord {
+            text: "Привет".into(),
+            origin: [10.0, 20.0],
+            across: [60.0, 0.0],
+            up: [0.0, 9.3],
+            confidence: None,
+            source: "tesseract".into(),
+        };
+        let mut plan = TextPlan::for_words(["Привет"]);
+        assert_eq!(plan.missing(), 0, "Inter covers Привет in every build");
+        for (i, font) in plan.fonts.iter_mut().enumerate() {
+            font.name = format!("PCOcr{i}");
+        }
+        let s = String::from_utf8(text_layer(std::slice::from_ref(&w), &plan)).unwrap();
+        assert!(s.contains("/PCOcr0 1 Tf"), "{s}");
+        assert!(!s.contains('?'), "{s}");
+    }
+
+    /// Without planned characters (an empty plan, or before the fonts are registered) the
+    /// WinAnsi path stands, '?' included.
     #[test]
     fn unplanned_words_fall_back_to_win_ansi_question_marks() {
         let w =
@@ -835,6 +885,13 @@ mod tests {
             assert_eq!(models.detection.canonicalize().unwrap(), models_dir.join(DETECTION_MODEL).canonicalize().unwrap(), "{name}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_builtin_models_read_english_and_russian_needs_tesseract() {
+        assert!(builtin_reads("en") && builtin_reads(" EN "));
+        assert!(!builtin_reads("ru") && !builtin_reads("de"));
+        assert!(DOCUMENT_LANGUAGES.iter().any(|(c, n)| *c == "ru" && *n == "Russian"));
     }
 
     /// The message tells end users what to do; release builds have no cargo.
